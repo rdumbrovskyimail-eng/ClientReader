@@ -1,113 +1,79 @@
 package com.client.app.ui.components
 
-import android.content.Context
-import android.os.Build
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.CubicBezierEasing
-import androidx.compose.animation.core.MutableTransitionState
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.automirrored.rounded.Undo
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.ContentPaste
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-
-// Чёрная палитра консоли промпта
-private val ColorPill = Color(0xFF111113)
-private val ColorSheet = Color(0xFF0D0D0F)
-private val ColorField = Color(0xFF151518)
-private val ColorButton = Color(0xFF1A1A1D)
-private val ColorHairline = Color(0xFF26262B)
-private val ColorHairlineFocused = Color(0xFF5A5A63)
-private val ColorTextPrimary = Color(0xFFF4F4F5)
-private val ColorTextSecondary = Color(0xFFA1A1AA)
-private val ColorTextMuted = Color(0xFF71717A)
-private val ColorApply = Color(0xFFF4F4F5)
-private val ColorOnApply = Color(0xFF09090B)
-private val ColorScrim = Color(0xCC000000)
-
-// Фирменная точка Gemini — единственный цветной акцент консоли
-private val GeminiAccent = Brush.sweepGradient(
-    listOf(Color(0xFF4285F4), Color(0xFFEA4335), Color(0xFFFBBC04), Color(0xFF34A853), Color(0xFF4285F4))
-)
-
-private val SheetShape = RoundedCornerShape(26.dp)
-private val FieldShape = RoundedCornerShape(18.dp)
-private val ButtonShape = RoundedCornerShape(14.dp)
-private val SheetEasing = CubicBezierEasing(0.16f, 1.0f, 0.3f, 1.0f)
+import com.client.app.ui.theme.Calm
+import com.client.app.ui.theme.CalmDurations
+import com.client.app.ui.theme.CalmEasing
+import kotlinx.coroutines.delay
 
 /**
- * Тактильный импульс щелчка для кнопок консоли.
- */
-private fun performTactileClick(context: Context) {
-    runCatching {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
-            val vibrator = vibratorManager?.defaultVibrator
-            if (vibrator?.hasVibrator() == true) {
-                vibrator.vibrate(
-                    VibrationEffect.startComposition()
-                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, 0.85f, 0)
-                        .compose()
-                )
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-            if (vibrator?.hasVibrator() == true) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-                } else {
-                    @Suppress("DEPRECATION")
-                    vibrator.vibrate(18L)
-                }
-            }
-        }
-    }
-}
-
-/**
- * Капсула «Prompt» в верхней панели: метка и первая строка текущей системной роли.
+ * Капсула «Роль ассистента» в верхней панели: первая строка текущей системной роли.
  */
 @Composable
 fun PromptPill(
@@ -115,66 +81,38 @@ fun PromptPill(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
-    val shape = RoundedCornerShape(23.dp)
+    val c = Calm.colors
+    val shape = RoundedCornerShape(28.dp)
     val preview = remember(prompt) {
         prompt.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
     }
 
     Row(
         modifier = modifier
-            .height(46.dp)
+            .heightIn(min = 56.dp)
             .clip(shape)
-            .background(ColorPill)
-            .border(1.dp, ColorHairline, shape)
-            .clickable {
-                performTactileClick(context)
-                onClick()
-            }
-            .padding(start = 6.dp, end = 16.dp),
+            .background(c.raised)
+            .border(1.dp, c.hairline, shape)
+            .clickable(role = Role.Button, onClickLabel = "Изменить роль ассистента", onClick = onClick)
+            .padding(start = 8.dp, end = 18.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             modifier = Modifier
-                .size(34.dp)
+                .size(40.dp)
                 .clip(CircleShape)
-                .background(ColorButton)
-                .border(1.dp, ColorHairline, CircleShape),
+                .background(c.accentSoft),
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                imageVector = Icons.Filled.Edit,
-                contentDescription = null,
-                tint = ColorTextPrimary,
-                modifier = Modifier.size(16.dp)
-            )
+            Icon(Icons.Rounded.EditNote, contentDescription = null, tint = c.onAccentSoft, modifier = Modifier.size(21.dp))
         }
-
-        Spacer(Modifier.width(10.dp))
-
+        Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(5.dp)
-                        .clip(CircleShape)
-                        .background(GeminiAccent)
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    text = "PROMPT",
-                    color = ColorTextMuted,
-                    fontSize = 9.5.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.8.sp
-                )
-            }
+            Text(text = "Роль ассистента", style = MaterialTheme.typography.labelSmall, color = c.inkFaint)
             Text(
-                text = preview.ifEmpty { "Роль не задана — нажмите, чтобы написать" },
-                color = if (preview.isEmpty()) ColorTextMuted else ColorTextPrimary,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
+                text = preview.ifEmpty { "Не задана — нажмите, чтобы описать" },
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (preview.isEmpty()) c.inkFaint else c.ink,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -183,12 +121,12 @@ fun PromptPill(
 }
 
 /**
- * Редактор поверх экрана: две вкладки — «Чтение вслух» (текст для диктора, любой объём) и «Роль»
- * (системная роль ассистента). Текст для чтения НЕ становится системным промптом.
+ * Шторка снизу с двумя вкладками: «Читать вслух» (текст для диктора, любой объём) и «Роль ассистента».
+ * Текст для чтения НЕ становится системной ролью.
  *
- * Шторка занимает всё место между строкой состояния и клавиатурой (insets statusBars + ime/navigationBars),
- * но не выше 640 dp. Когда открывается клавиатура, сжимается только поле ввода (оно прокручивается),
- * а заголовок, счётчик и кнопки всегда остаются на экране.
+ * Спокойные детали: понятные подсказки, счётчик со временем чтения, «Очистить» с возможностью вернуть
+ * текст (6 секунд), кнопка «Читать» неактивна, пока поле пустое — вместо всплывающих предупреждений.
+ * Шторка всегда помещается над клавиатурой: сжимается только поле ввода.
  */
 @Composable
 fun PromptEditorSheet(
@@ -198,326 +136,302 @@ fun PromptEditorSheet(
     onDismiss: () -> Unit,
     readText: String = "",
     onReadTextChange: (String) -> Unit = {},
-    onRead: ((String) -> Unit)? = null
+    onRead: ((String) -> Unit)? = null,
+    startInReadMode: Boolean = true
 ) {
-    val context = LocalContext.current
+    val c = Calm.colors
+    val motion = Calm.motion
+    val focusManager = LocalFocusManager.current
 
-    BackHandler(enabled = visible) {
-        performTactileClick(context)
+    fun close() {
+        focusManager.clearFocus(force = true)
         onDismiss()
     }
 
+    BackHandler(enabled = visible) { close() }
+
+    // Затемнение
     AnimatedVisibility(
         visible = visible,
-        enter = fadeIn(animationSpec = tween(durationMillis = 180)),
-        exit = fadeOut(animationSpec = tween(durationMillis = 160))
+        enter = fadeIn(motion.fade(CalmDurations.MEDIUM)),
+        exit = fadeOut(motion.fade())
     ) {
-        val clipboardManager = LocalClipboardManager.current
-        val focusManager = LocalFocusManager.current
-        var draft by remember { mutableStateOf(currentPrompt) }
-        // Основной сценарий — чтение вслух: шторка открывается на вкладке текста для диктора
-        var readMode by remember { mutableStateOf(onRead != null) }
-        val sheetState = remember { MutableTransitionState(false) }.apply { targetState = true }
-        val fieldInteraction = remember { MutableInteractionSource() }
-        val fieldFocused by fieldInteraction.collectIsFocusedAsState()
-
-        val text = if (readMode) readText else draft
-        fun setText(value: String) {
-            if (readMode) onReadTextChange(value) else draft = value
-        }
-
-        fun close() {
-            focusManager.clearFocus(force = true)
-            onDismiss()
-        }
-
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(ColorScrim)
+                .background(c.scrim)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
-                    indication = null
-                ) { close() }
+                    indication = null,
+                    onClickLabel = "Закрыть",
+                    onClick = { close() }
+                )
+        )
+    }
+
+    // Шторка
+    AnimatedVisibility(
+        visible = visible,
+        enter = if (motion.reduced) {
+            fadeIn(motion.fade())
+        } else {
+            slideInVertically(motion.spec(CalmDurations.LONG, CalmEasing.Enter)) { it / 3 } + fadeIn(motion.fade(CalmDurations.MEDIUM))
+        },
+        exit = if (motion.reduced) {
+            fadeOut(motion.fade())
+        } else {
+            slideOutVertically(motion.spec(CalmDurations.SHORT, CalmEasing.Exit)) { it / 4 } + fadeOut(motion.fade())
+        }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.statusBars)
                 .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
-                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .padding(top = 12.dp),
+            contentAlignment = Alignment.BottomCenter
         ) {
-            AnimatedVisibility(
-                visibleState = sheetState,
-                enter = slideInVertically(
-                    animationSpec = tween(durationMillis = 340, easing = SheetEasing),
-                    initialOffsetY = { -it / 6 }
-                ) + fadeIn(animationSpec = tween(durationMillis = 220)),
-                exit = fadeOut(animationSpec = tween(durationMillis = 120))
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 640.dp)
-                        .fillMaxHeight()
-                        .clip(SheetShape)
-                        .background(ColorSheet)
-                        .border(1.dp, ColorHairline, SheetShape)
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null
-                        ) { /* клики внутри шторки её не закрывают */ }
-                        .padding(18.dp)
-                ) {
-                    // Шапка
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .clip(CircleShape)
-                                        .background(GeminiAccent)
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Text(
-                                    text = if (readMode) "ЧТЕНИЕ ВСЛУХ" else "SYSTEM PROMPT",
-                                    color = ColorTextMuted,
-                                    fontSize = 10.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontWeight = FontWeight.Bold,
-                                    letterSpacing = 1.8.sp
-                                )
-                            }
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                text = if (readMode) "Текст для диктора" else "Роль и правила ассистента",
-                                color = ColorTextPrimary,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Spacer(Modifier.height(3.dp))
+            SheetContent(
+                currentPrompt = currentPrompt,
+                onApply = onApply,
+                readText = readText,
+                onReadTextChange = onReadTextChange,
+                onRead = onRead,
+                startInReadMode = startInReadMode,
+                onClose = { close() }
+            )
+        }
+    }
+}
+
+@Composable
+private fun SheetContent(
+    currentPrompt: String,
+    onApply: (String) -> Unit,
+    readText: String,
+    onReadTextChange: (String) -> Unit,
+    onRead: ((String) -> Unit)?,
+    startInReadMode: Boolean,
+    onClose: () -> Unit
+) {
+    val c = Calm.colors
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var draft by remember { mutableStateOf(currentPrompt) }
+    var readMode by remember { mutableStateOf(onRead != null && startInReadMode) }
+    var undoText by remember { mutableStateOf<String?>(null) }
+    val fieldInteraction = remember { MutableInteractionSource() }
+    val fieldFocused by fieldInteraction.collectIsFocusedAsState()
+
+    val text = if (readMode) readText else draft
+    fun setText(value: String) {
+        if (readMode) onReadTextChange(value) else draft = value
+    }
+
+    // «Вернуть» после очистки доступно 6 секунд
+    LaunchedEffect(undoText) {
+        if (undoText != null) {
+            delay(6_000)
+            undoText = null
+        }
+    }
+
+    val sheetShape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp, bottomStart = 20.dp, bottomEnd = 20.dp)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 760.dp)
+            .fillMaxHeight()
+            .padding(horizontal = 8.dp)
+            .clip(sheetShape)
+            .background(c.raised)
+            .border(1.dp, c.hairline, sheetShape)
+            // Касания по пустому месту шторки поглощаются и не закрывают её (без лишней семантики для TalkBack)
+            .pointerInput(Unit) { detectTapGestures { } }
+            .padding(start = 20.dp, end = 12.dp, top = 12.dp, bottom = 16.dp)
+    ) {
+        // Шапка
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = if (readMode) "Текст для чтения" else "Роль ассистента",
+                style = MaterialTheme.typography.titleLarge,
+                color = c.ink,
+                modifier = Modifier.weight(1f)
+            )
+            CalmIconButton(
+                icon = Icons.Rounded.Close,
+                contentDescription = "Закрыть",
+                onClick = onClose,
+                container = c.raisedStrong,
+                tint = c.inkSoft
+            )
+        }
+
+        Column(Modifier.padding(end = 8.dp)) {
+            if (onRead != null) {
+                Spacer(Modifier.height(10.dp))
+                CalmSegmented(
+                    options = listOf("Читать вслух", "Роль ассистента"),
+                    selectedIndex = if (readMode) 0 else 1,
+                    onSelect = {
+                        readMode = it == 0
+                        undoText = null
+                    }
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = if (readMode) {
+                    "Вставьте любой текст — я прочитаю его целиком. Остановить, переспросить или продолжить можно голосом, кнопкой или гарнитурой."
+                } else {
+                    "Опишите, каким должен быть ассистент. Роль применится сразу; если разговор идёт, он мягко переподключится."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = c.inkSoft
+            )
+            Spacer(Modifier.height(12.dp))
+        }
+
+        // Поле ввода: занимает всё свободное место и прокручивается внутри
+        val fieldShape = RoundedCornerShape(20.dp)
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(end = 8.dp)
+                .clip(fieldShape)
+                .background(c.sunken)
+                .border(if (fieldFocused) 1.5.dp else 1.dp, if (fieldFocused) c.accent else c.hairline, fieldShape)
+                .padding(horizontal = 16.dp, vertical = 14.dp)
+        ) {
+            BasicTextField(
+                value = text,
+                onValueChange = { setText(it) },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .semantics { contentDescription = if (readMode) "Текст для чтения" else "Роль ассистента" },
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = c.ink),
+                interactionSource = fieldInteraction,
+                cursorBrush = SolidColor(c.accent),
+                decorationBox = { inner ->
+                    Box(Modifier.fillMaxSize()) {
+                        if (text.isEmpty()) {
                             Text(
                                 text = if (readMode) {
-                                    "Любой объём: диктор прочитает всё. Пауза и продолжение — голосом, кнопкой или гарнитурой."
+                                    "Например, статью, главу книги или заметки. Абзацы, диалоги, списки и числа прочитаю с правильной интонацией."
                                 } else {
-                                    "Применяется сразу: активная сессия переподключится с новой ролью."
+                                    "Например: «Ты — терпеливый преподаватель немецкого. Отвечай коротко и по делу.»"
                                 },
-                                color = ColorTextSecondary,
-                                fontSize = 12.sp,
-                                lineHeight = 16.sp
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = c.inkFaint
                             )
                         }
-                        Spacer(Modifier.width(12.dp))
-                        SheetIconButton(
-                            icon = Icons.Filled.Close,
-                            description = "Закрыть",
-                            size = 38
-                        ) {
-                            performTactileClick(context)
-                            close()
-                        }
-                    }
-
-                    if (onRead != null) {
-                        Spacer(Modifier.height(12.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            ModeChip("Чтение вслух", selected = readMode) {
-                                performTactileClick(context)
-                                readMode = true
-                            }
-                            ModeChip("Роль ассистента", selected = !readMode) {
-                                performTactileClick(context)
-                                readMode = false
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(14.dp))
-
-                    // Поле ввода: забирает всё оставшееся место и прокручивается внутри себя
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                            .clip(FieldShape)
-                            .background(ColorField)
-                            .border(1.dp, if (fieldFocused) ColorHairlineFocused else ColorHairline, FieldShape)
-                            .padding(horizontal = 16.dp, vertical = 14.dp)
-                    ) {
-                        BasicTextField(
-                            value = text,
-                            onValueChange = { setText(it) },
-                            modifier = Modifier.fillMaxSize(),
-                            textStyle = TextStyle(
-                                color = ColorTextPrimary,
-                                fontSize = 15.sp,
-                                lineHeight = 22.sp,
-                                fontFamily = FontFamily.SansSerif
-                            ),
-                            interactionSource = fieldInteraction,
-                            cursorBrush = SolidColor(ColorTextPrimary),
-                            decorationBox = { innerTextField ->
-                                Box(modifier = Modifier.fillMaxSize()) {
-                                    if (text.isEmpty()) {
-                                        Text(
-                                            text = if (readMode) {
-                                                "Вставьте сюда текст — кнопка «Вставить» внизу. Абзацы, диалоги, списки и числа диктор прочитает с правильной интонацией."
-                                            } else {
-                                                "Например: «Ты — терпеливый преподаватель немецкого. Отвечай коротко и по делу.»"
-                                            },
-                                            color = ColorTextMuted,
-                                            fontSize = 15.sp,
-                                            lineHeight = 22.sp
-                                        )
-                                    }
-                                    innerTextField()
-                                }
-                            }
-                        )
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = if (readMode && text.isNotBlank()) {
-                            // ≈ 14,5 символа в секунду — средний темп диктора
-                            "${text.length} симв. · ≈ ${(text.length / 14.5f / 60f).toInt().coerceAtLeast(1)} мин чтения"
-                        } else {
-                            "${text.length} симв."
-                        },
-                        color = ColorTextMuted,
-                        fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.align(Alignment.End)
-                    )
-                    Spacer(Modifier.height(10.dp))
-
-                    // Панель действий
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        SheetIconButton(icon = Icons.Filled.ContentCopy, description = "Копировать") {
-                            performTactileClick(context)
-                            if (text.isNotBlank()) {
-                                clipboardManager.setText(AnnotatedString(text))
-                                Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                        SheetIconButton(icon = Icons.Filled.ContentPaste, description = "Вставить") {
-                            performTactileClick(context)
-                            val pasted = clipboardManager.getText()?.text.orEmpty()
-                            if (pasted.isNotBlank()) {
-                                setText(if (text.isBlank()) pasted else "$text\n$pasted")
-                            }
-                        }
-                        SheetIconButton(icon = Icons.Filled.DeleteOutline, description = "Очистить") {
-                            performTactileClick(context)
-                            setText("")
-                        }
-
-                        Row(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(46.dp)
-                                .clip(ButtonShape)
-                                .background(ColorApply)
-                                .clickable {
-                                    performTactileClick(context)
-                                    if (readMode && onRead != null) {
-                                        val clean = readText.trim()
-                                        if (clean.isEmpty()) {
-                                            Toast.makeText(context, "Вставьте текст для чтения", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            onRead(clean)
-                                            close()
-                                            Toast.makeText(context, "Читаю…", Toast.LENGTH_SHORT).show()
-                                        }
-                                        return@clickable
-                                    }
-                                    val clean = draft.trim()
-                                    val changed = clean != currentPrompt.trim()
-                                    if (changed) onApply(clean)
-                                    close()
-                                    Toast.makeText(
-                                        context,
-                                        if (changed) "Роль применена" else "Без изменений",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                },
-                            horizontalArrangement = Arrangement.Center,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = if (readMode) Icons.Filled.PlayArrow else Icons.Filled.Check,
-                                contentDescription = null,
-                                tint = ColorOnApply,
-                                modifier = Modifier.size(17.dp)
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                text = if (readMode) "Читать" else "Готово",
-                                color = ColorOnApply,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.3.sp
-                            )
-                        }
+                        inner()
                     }
                 }
+            )
+        }
+
+        // Счётчик или «Вернуть»
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 40.dp)
+                .padding(end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val undo = undoText
+            if (undo != null) {
+                Text("Текст очищен", style = MaterialTheme.typography.bodySmall, color = c.inkSoft, modifier = Modifier.weight(1f))
+                QuietTextButton(
+                    text = "Вернуть",
+                    icon = Icons.AutoMirrored.Rounded.Undo,
+                    onClick = {
+                        setText(undo)
+                        undoText = null
+                    }
+                )
+            } else {
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = counterLine(text, readMode),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = c.inkFaint
+                )
+            }
+        }
+
+        // Действия
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(end = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            CalmIconButton(icon = Icons.Rounded.ContentPaste, contentDescription = "Вставить из буфера обмена", onClick = {
+                val pasted = clipboard.getText()?.text.orEmpty()
+                if (pasted.isNotBlank()) {
+                    undoText = null
+                    setText(if (text.isBlank()) pasted else "$text\n$pasted")
+                } else {
+                    Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()
+                }
+            })
+            CalmIconButton(icon = Icons.Rounded.ContentCopy, contentDescription = "Копировать", enabled = text.isNotBlank(), onClick = {
+                clipboard.setText(AnnotatedString(text))
+                Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+            })
+            CalmIconButton(icon = Icons.Rounded.DeleteOutline, contentDescription = "Очистить поле", enabled = text.isNotEmpty(), onClick = {
+                undoText = text
+                setText("")
+            })
+
+            if (readMode && onRead != null) {
+                PrimaryPillButton(
+                    text = "Читать",
+                    icon = Icons.Rounded.PlayArrow,
+                    enabled = readText.isNotBlank(),
+                    onClick = {
+                        onRead(readText.trim())
+                        onClose()
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+            } else {
+                PrimaryPillButton(
+                    text = "Сохранить роль",
+                    icon = Icons.Rounded.Check,
+                    onClick = {
+                        val clean = draft.trim()
+                        val changed = clean != currentPrompt.trim()
+                        if (changed) onApply(clean)
+                        onClose()
+                        Toast.makeText(context, if (changed) "Роль сохранена" else "Роль не изменилась", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.weight(1f)
+                )
             }
         }
     }
 }
 
-/**
- * Переключатель вкладок шторки («Чтение вслух» / «Роль ассистента»).
- */
-@Composable
-private fun ModeChip(label: String, selected: Boolean, onClick: () -> Unit) {
-    val shape = RoundedCornerShape(12.dp)
-    Box(
-        modifier = Modifier
-            .clip(shape)
-            .background(if (selected) ColorApply else ColorButton)
-            .border(1.dp, if (selected) ColorApply else ColorHairline, shape)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 8.dp)
-    ) {
-        Text(
-            text = label,
-            color = if (selected) ColorOnApply else ColorTextSecondary,
-            fontSize = 12.5.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
-        )
-    }
+/** «12 340 знаков · ≈ 14 мин чтения» — средний темп диктора ≈ 14,5 знака в секунду. */
+private fun counterLine(text: String, readMode: Boolean): String {
+    val n = text.length
+    val grouped = n.toString().reversed().chunked(3).joinToString(" ").reversed()
+    if (!readMode || text.isBlank()) return "$grouped ${plural(n, "знак", "знака", "знаков")}"
+    val minutes = (n / 14.5f / 60f).toInt().coerceAtLeast(1)
+    return "$grouped ${plural(n, "знак", "знака", "знаков")} · ≈ $minutes мин чтения"
 }
 
-/**
- * Квадратная графитовая кнопка-пиктограмма консоли.
- */
-@Composable
-private fun SheetIconButton(
-    icon: ImageVector,
-    description: String,
-    size: Int = 46,
-    onClick: () -> Unit
-) {
-    val shape = if (size < 46) CircleShape else ButtonShape
-    Box(
-        modifier = Modifier
-            .size(size.dp)
-            .clip(shape)
-            .background(ColorButton)
-            .border(1.dp, ColorHairline, shape)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = description,
-            tint = ColorTextPrimary,
-            modifier = Modifier.size(18.dp)
-        )
+private fun plural(n: Int, one: String, few: String, many: String): String {
+    val mod100 = n % 100
+    val mod10 = n % 10
+    return when {
+        mod100 in 11..14 -> many
+        mod10 == 1 -> one
+        mod10 in 2..4 -> few
+        else -> many
     }
 }
