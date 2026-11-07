@@ -40,11 +40,14 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.client.app.reader.ReaderStatus
 import com.client.app.session.LinkState
+import com.client.app.session.SessionProfile
 import com.client.app.session.SessionState
 import com.client.app.ui.components.FmStripAudioVisualizer
 import com.client.app.ui.components.PromptEditorSheet
 import com.client.app.ui.components.PromptPill
+import com.client.app.ui.components.ReaderControlBar
 import com.client.app.ui.components.SessionControlPill
 import com.client.app.ui.components.SettingsGearButton
 import com.client.app.viewmodel.ClientViewModel
@@ -78,6 +81,10 @@ fun ClientScreen(
     val context = LocalContext.current
 
     var promptOpen by rememberSaveable { mutableStateOf(false) }
+    // Текст для чтения живёт, пока открыт экран (не в rememberSaveable: большой текст не влезет в Bundle)
+    var readDraft by remember { mutableStateOf("") }
+    // Действие, ожидающее выдачи разрешений (чтение вслух / продолжение сохранённого)
+    var pendingAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     // Последний текст ошибки нужен, чтобы баннер не опустел во время анимации скрытия
     var lastError by remember { mutableStateOf("") }
@@ -90,18 +97,17 @@ fun ClientScreen(
             context, Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
-        if (audioGranted && viewModel.state.value.link == LinkState.IDLE) {
+        val pending = pendingAction
+        pendingAction = null
+        if (pending != null) {
+            // Чтение работает и без микрофона — тогда только без голосовых команд
+            pending()
+        } else if (audioGranted && viewModel.state.value.link == LinkState.IDLE) {
             viewModel.toggleConnection()
         }
     }
 
-    fun handleSessionClick() {
-        // Остановка сессии разрешений не требует
-        if (viewModel.state.value.link != LinkState.IDLE) {
-            viewModel.toggleConnection()
-            return
-        }
-
+    fun missingPermissions(): List<String> {
         val missing = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             missing.add(Manifest.permission.RECORD_AUDIO)
@@ -117,6 +123,17 @@ fun ClientScreen(
             missing.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
+        return missing
+    }
+
+    fun handleSessionClick() {
+        // Остановка сессии разрешений не требует
+        if (viewModel.state.value.link != LinkState.IDLE) {
+            viewModel.toggleConnection()
+            return
+        }
+
+        val missing = missingPermissions()
         if (missing.isEmpty()) {
             viewModel.toggleConnection()
         } else {
@@ -190,6 +207,15 @@ fun ClientScreen(
                 state = state,
                 modifier = Modifier.padding(horizontal = 32.dp)
             )
+
+            // Панель Live-читалки (или карточка «Продолжить чтение»)
+            ReaderControlBar(
+                reader = state.reader,
+                onCommand = { viewModel.readerCommand(it) },
+                onResumeSaved = { runWithPermissions { viewModel.resumeSavedReading() } },
+                onDiscardSaved = { viewModel.discardSavedReading() },
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 18.dp)
+            )
             Spacer(Modifier.weight(1.15f))
 
             // =================================================================
@@ -220,7 +246,10 @@ fun ClientScreen(
             visible = promptOpen,
             currentPrompt = state.activePrompt,
             onApply = { viewModel.applyPrompt(it) },
-            onDismiss = { promptOpen = false }
+            onDismiss = { promptOpen = false },
+            readText = readDraft,
+            onReadTextChange = { readDraft = it },
+            onRead = { text -> runWithPermissions { viewModel.startReading(text) } }
         )
     }
 }
@@ -230,7 +259,19 @@ private fun SessionStatusHero(
     state: SessionState,
     modifier: Modifier = Modifier
 ) {
+    val reader = state.reader
     val status = when {
+        state.link == LinkState.RECONNECTING && reader.isActive ->
+            "Восстановление связи" to "Чтение продолжится с того же места"
+        reader.isActive -> when (reader.status) {
+            ReaderStatus.PREPARING -> "Готовлю чтение" to "Подключаю диктора…"
+            ReaderStatus.BUFFERING -> "Читаю" to "Подгружаю звук — сеть медленная"
+            ReaderStatus.ANSWERING -> "Отвечаю" to "Скажите «продолжай», чтобы вернуться к тексту"
+            ReaderStatus.PAUSED -> "Пауза" to "«Продолжай» — голосом, кнопкой или гарнитурой"
+            else -> "Читаю вслух" to "Скажите «стоп», «повтори» или задайте вопрос по тексту"
+        }
+        state.profile == SessionProfile.READER && reader.status == ReaderStatus.FINISHED ->
+            "Дочитано" to "Вставьте новый текст в редактор и нажмите «Читать»"
         state.link == LinkState.CONNECTING ->
             "Подключение" to "Открываю защищённый канал с Gemini"
         state.link == LinkState.RECONNECTING ->
