@@ -787,6 +787,9 @@ class LiveReaderController(
                 inFlight = null
                 nextSendNotBeforeMs = host.now() + 700L
             }
+            // Запрос, отменённый командой (повтор/перемотка/стоп), так и не ушёл на сервер — «призрачной»
+            // генерации не будет, ждать её (до 4 с) незачем
+            if (!ok && plan.turn.discarded && plan.turn.serverTurnId < 0L) orphanSinceMs = 0L
         }
     }
 
