@@ -2,6 +2,8 @@ package com.client.app.session
 
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
@@ -20,22 +22,37 @@ import com.client.app.attach.VocabularyExtractor
 import com.client.app.audio.AudioFocusEvent
 import com.client.app.audio.AudioStreamControlEvent
 import com.client.app.audio.AudioStreamDataEvent
+import com.client.app.audio.BargeInMode
 import com.client.app.audio.CaptureShutdownResult
 import com.client.app.audio.MicEvent
 import com.client.app.audio.NativeAudioEngine
+import com.client.app.audio.PlaybackHoldOwner
 import com.client.app.audio.PronunciationPlayer
 import com.client.app.forvo.ForvoRepository
 import com.client.app.forvo.ForvoResult
+import com.client.app.reader.AudioDecision
+import com.client.app.reader.LiveReaderController
+import com.client.app.reader.PauseReason
+import com.client.app.reader.ReaderAudioPort
+import com.client.app.reader.ReaderCommand
+import com.client.app.reader.ReaderHost
+import com.client.app.reader.ReaderPace
+import com.client.app.reader.ReaderProgressStore
+import com.client.app.reader.ReaderPrompts
+import com.client.app.reader.ReaderTransportPort
+import com.client.app.reader.ReaderUiState
 import com.client.app.service.LiveSessionForegroundService
 import com.client.app.util.AppLogger
 import com.client.app.util.AttachmentProcessor
 import com.client.app.util.CryptoManager
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
+import java.io.File
 import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -67,6 +84,9 @@ data class ForvoWord(
 
 enum class LinkState { IDLE, CONNECTING, LIVE, RECONNECTING }
 
+/** Профиль Live-сессии: разговор с ассистентом или диктор-читалка (своя системная инструкция и настройки). */
+enum class SessionProfile { CONVERSATION, READER }
+
 data class SessionState(
     val link: LinkState = LinkState.IDLE,
     val isMicActive: Boolean = false,
@@ -78,7 +98,9 @@ data class SessionState(
     val forvoWords: List<ForvoWord> = emptyList(),
     val forvoUsed: Int = 0,
     val forvoLimit: Int = 500,
-    val tokensUsed: Int = 0
+    val tokensUsed: Int = 0,
+    val profile: SessionProfile = SessionProfile.CONVERSATION,
+    val reader: ReaderUiState = ReaderUiState()
 ) {
     val isConnected: Boolean get() = link == LinkState.LIVE
     val isConnecting: Boolean get() = link == LinkState.CONNECTING || link == LinkState.RECONNECTING
@@ -150,14 +172,36 @@ class SessionManager @Inject constructor(
         val KEY_VOLUME = floatPreferencesKey("audio_volume")
         val KEY_MIC_GAIN = floatPreferencesKey("audio_mic_gain")
 
+        // Live-читалка
+        val KEY_READER_PACE = stringPreferencesKey("reader_pace")
+        val KEY_READER_VOICE_COMMANDS = booleanPreferencesKey("reader_voice_commands")
+
         const val DEFAULT_SYSTEM_PROMPT =
             "Ты — интеллектуальный персональный голосовой ассистент с академической культурой речи. " +
             "Отвечай лаконично, точно и структурированно, без шаблонных вводных слов."
 
         const val DEFAULT_LIVE_MODEL = "gemini-3.8-live"
+        const val READER_LIVE_MODEL = "gemini-3.8-live"
+
+        // Мужской голос диктора: «Informative», рекомендован для повествования и документальной подачи
+        const val DEFAULT_VOICE = "Charon"
+        const val DEFAULT_SILENCE_DURATION_MS = 700
+        // Hi-Fi Bluetooth по умолчанию: A2DP 48 кГц стерео вместо узкополосного HFP 16 кГц
+        const val DEFAULT_BT_HIFI = true
+
+        // Читалке не нужна длинная история: каждый фрагмент самодостаточен, а весь контекст
+        // перевыставляется в счёт каждого хода. Окно ≈ 2–8 минут звука вместо 20+ минут
+        private const val READER_COMPRESSION_TRIGGER_TOKENS = 12_000
+        private const val READER_COMPRESSION_TARGET_TOKENS = 4_000
 
         private const val MAX_MESSAGES = 200
-        private const val MAX_RECONNECT_ATTEMPTS = 5
+        // ≈ 9 минут попыток с шагом до 15 с: блокировка экрана/лифт/метро не должны рвать чтение
+        private const val MAX_RECONNECT_ATTEMPTS = 40
+        private const val MAX_RECONNECT_BACKOFF_MS = 15_000L
+        // Разговор: ответ, удержанный потерей фокуса дольше минуты (звонок), не доигрывается
+        private const val STALE_FOCUS_HOLD_MS = 60_000L
+        // Читалка дочитала/остановлена: открытая сессия закрывается через 10 минут простоя
+        private const val READER_IDLE_DISCONNECT_MS = 10 * 60_000L
     }
 
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
@@ -215,6 +259,106 @@ class SessionManager @Inject constructor(
     private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
     private val cancelledToolCallKeys = ConcurrentHashMap.newKeySet<ToolCallKey>()
 
+    // --- Профиль сессии, видимость UI, фоновый режим ---
+    @Volatile private var sessionProfile = SessionProfile.CONVERSATION
+    @Volatile private var uiVisible = true
+    @Volatile private var screenInteractive = true
+    @Volatile private var currentServerSilenceMs = DEFAULT_SILENCE_DURATION_MS + 200
+    @Volatile private var sessionSpeechLanguage = "ru-RU"
+    @Volatile private var focusLostPermanently = false
+    @Volatile private var focusHoldSinceMs = 0L
+    @Volatile private var readerVoiceCommands = true
+    @Volatile private var currentVolume = 1.0f
+
+    // --- Сторож сбоев 3.8 («немой» ответ, «беглое» аудио) ---
+    private val turnWatchdog = LiveTurnWatchdog { SystemClock.elapsedRealtime() }
+    private val silentRecoveryTimes = ArrayDeque<Long>()
+    @Volatile private var pendingSilentNudge = false
+
+    // Закрытия 1008 у работающей сессии (сбой 3.8): чистое переподключение не чаще 2 раз за 2 минуты
+    private val policyCloseTimes = ArrayDeque<Long>()
+
+    // Для бесшовного goAway: конец последней реплики пользователя и последнего хода модели
+    @Volatile private var lastUserTurnEndMs = 0L
+    @Volatile private var lastModelTurnEndMs = 0L
+
+    // Сеть снова доступна — переподключение без ожидания backoff
+    private val networkAvailableSignal = Channel<Unit>(Channel.CONFLATED)
+
+    // Ответ модели во время паузы читалки придерживается ~0,7 с, пока не ясно, команда это или ответ
+    private val heldInteractionFrames = ArrayDeque<AudioFrame>()
+
+    // Очередь подачи звука в движок (см. observeAudio) — объявлена до init: её читают корутины init
+    private val playQueue = Channel<AudioFrame>(Channel.UNLIMITED)
+    private val playQueueDepth = java.util.concurrent.atomic.AtomicInteger(0)
+
+    // --- Live-читалка ---
+    private val readerStore = ReaderProgressStore(File(context.filesDir, "reader"))
+
+    private val readerTransport = object : ReaderTransportPort {
+        override fun isSessionReady(): Boolean =
+            sessionProfile == SessionProfile.READER && _state.value.link == LinkState.LIVE && client.isReady
+
+        override fun sessionKey(): Long = client.epoch
+
+        override suspend fun sendUserTurn(text: String): Boolean =
+            if (activeLiveCapabilities.supportsMidSessionClientContent) {
+                client.sendClientContent(listOf(ClientTurn(ClientRole.USER, text)), turnComplete = true)
+            } else {
+                client.sendRealtimeText(text)
+                true
+            }
+
+        override fun isGenerationInProgress(): Boolean = client.isGenerationInProgress
+        override fun activeServerTurnId(): Long = client.activeServerTurnId
+        override fun transportBacklogFrames(): Long = client.pendingTransportAudioBytes() / 2L
+    }
+
+    private val readerAudio = object : ReaderAudioPort {
+        override fun setReaderHold(held: Boolean) = audioEngine.setPlaybackHold(PlaybackHoldOwner.READER, held)
+        override fun setBargeInHold(held: Boolean) = audioEngine.setPlaybackHold(PlaybackHoldOwner.BARGE_IN, held)
+        override fun playbackGeneration(): Long = audioEngine.currentPlaybackGeneration
+        override fun enqueuedFrames(): Long = audioEngine.enqueuedFramesInGeneration
+        override fun pendingFrames(): Long = audioEngine.pendingModelFrames()
+        // Без purge очереди транспорта: ещё не разобранные кадры нужного хода (ответ на вопрос)
+        // иначе потерялись бы; ненужные кадры читалка отбрасывает сама (decideAudio → DROP),
+        // а уже разобранные отсекаются по поколению воспроизведения
+        override fun flushPlayback(reason: String): Long = audioEngine.invalidateAndFlushPlayback(reason)
+        override fun adjustVolume(up: Boolean): Float {
+            val next = (currentVolume + if (up) 0.15f else -0.15f).coerceIn(0.2f, 1.0f)
+            currentVolume = next
+            audioEngine.setVolume(next)
+            scope.launch { runCatching { dataStore.edit { it[KEY_VOLUME] = next } } }
+            return next
+        }
+    }
+
+    private val readerHost = object : ReaderHost {
+        override suspend fun ensureReaderSession(): Boolean = ensureReaderSessionInternal()
+        override fun isGoAwayPending(): Boolean = pendingGoAway
+        override fun requestPlannedReconnect(reason: String) {
+            pendingGoAway = false
+            goAwayToken.incrementAndGet()
+            scheduleReconnect(reason, client.epoch, immediate = true)
+        }
+        override fun requestFreshSession(reason: String) = requestFreshSessionInternal(reason)
+        override fun onUiState(state: ReaderUiState) {
+            _state.update { it.copy(reader = state) }
+        }
+        override fun log(message: String) = logger.d(message)
+        override fun now(): Long = SystemClock.elapsedRealtime()
+    }
+
+    private val reader = LiveReaderController(
+        scope = scope,
+        transport = readerTransport,
+        audio = readerAudio,
+        host = readerHost,
+        store = readerStore
+    )
+
+    private fun readerActive(): Boolean = sessionProfile == SessionProfile.READER && reader.isActive
+
     init {
         observeSettings()
         observeEvents()
@@ -222,6 +366,11 @@ class SessionManager @Inject constructor(
         observeBargeIn()
         observeFocus()
         observeForvoQuota()
+        observeNetwork()
+        observeTurnWatchdog()
+        observeHeldInteractionFrames()
+        observeReaderIdle()
+        _state.update { it.copy(reader = reader.uiState()) }
         scope.launch(Dispatchers.IO) { audioEngine.prewarmVad() }
     }
 
@@ -238,8 +387,11 @@ class SessionManager @Inject constructor(
                     connectionDesired = false
                     userMicDesired = false
                     cancelReconnectWork()
+                    if (reader.isActive) reader.stop()
                     stopInternal(full = true)
                 } else {
+                    // Кнопка Start Session — разговор; читалка поднимает свой профиль сама
+                    sessionProfile = SessionProfile.CONVERSATION
                     connectionDesired = true
                     userMicDesired = true
                     reconnectAttempts = 0
@@ -286,6 +438,8 @@ class SessionManager @Inject constructor(
                         _state.value.link == LinkState.LIVE &&
                         client.isReady
                     ) {
+                        // Звук был занят другим приложением — включение микрофона = «я снова здесь»
+                        reacquireFocusLocked()
                         startMicLocked()
                     } else {
                         _state.update {
@@ -304,8 +458,196 @@ class SessionManager @Inject constructor(
             mutex.withLock {
                 connectionDesired = false
                 userMicDesired = false
+                if (reader.isActive) reader.stop()
                 stopInternal(full = true)
             }
+        }
+    }
+
+    // =====================================================================================
+    // Live-читалка: публичное API для UI, уведомления и кнопок гарнитуры
+    // =====================================================================================
+
+    /** Прочитать вслух большой текст (не становится системным промптом). */
+    fun startReading(text: String) = scope.launch {
+        val clean = text.trim()
+        if (clean.isEmpty()) return@launch
+        // Звук занят другим приложением — фокус запрашивается заново (действие пользователя)
+        val focusOk = regainFocusIfLost()
+        commandMutex.withLock {
+            if (!reader.load(clean)) {
+                _state.update { it.copy(error = "В тексте нет предложений для чтения") }
+            } else if (!focusOk) {
+                reader.pause(PauseReason.FOCUS_PERMANENT)
+            }
+        }
+    }
+
+    fun resumeSavedReading() = scope.launch {
+        val focusOk = regainFocusIfLost()
+        commandMutex.withLock {
+            if (!reader.resumeSaved()) {
+                _state.update { it.copy(error = "Сохранённый текст не найден") }
+            } else if (!focusOk) {
+                reader.pause(PauseReason.FOCUS_PERMANENT)
+            }
+        }
+    }
+
+    fun discardSavedReading() = scope.launch { reader.discardSaved() }
+
+    fun readerCommand(command: ReaderCommand) = scope.launch {
+        if (command == ReaderCommand.Resume || command == ReaderCommand.Toggle) {
+            regainFocusIfLost()
+        }
+        reader.command(command)
+        if (command is ReaderCommand.SetPace) {
+            runCatching { dataStore.edit { it[KEY_READER_PACE] = command.pace.wire } }
+        }
+    }
+
+    /** Кнопка Play/Pause гарнитуры, экрана блокировки, уведомления. */
+    fun mediaPlayPause() {
+        if (reader.isActive) {
+            readerCommand(ReaderCommand.Toggle)
+            return
+        }
+        scope.launch {
+            val held = audioEngine.isPlaybackHeld(PlaybackHoldOwner.USER)
+            if (held) regainFocusIfLost()
+            audioEngine.setPlaybackHold(PlaybackHoldOwner.USER, !held)
+        }
+    }
+
+    fun mediaPlay() {
+        if (reader.isActive) {
+            readerCommand(ReaderCommand.Resume)
+            return
+        }
+        scope.launch {
+            regainFocusIfLost()
+            audioEngine.setPlaybackHold(PlaybackHoldOwner.USER, false)
+        }
+    }
+
+    fun mediaPause() {
+        if (reader.isActive) {
+            readerCommand(ReaderCommand.Pause)
+            return
+        }
+        audioEngine.setPlaybackHold(PlaybackHoldOwner.USER, true)
+    }
+
+    /** Activity видна/скрыта: спектр, профиль буферизации, защитное окно от «шумов касания». */
+    fun onUiVisibilityChanged(visible: Boolean) {
+        uiVisible = visible
+        audioEngine.setUiVisible(visible)
+        audioEngine.armHandlingGuard(1_200L)
+        applyPlaybackBufferProfile()
+    }
+
+    /** Экран включён/выключен (приходит из foreground-сервиса). */
+    fun onScreenInteractiveChanged(interactive: Boolean) {
+        screenInteractive = interactive
+        audioEngine.armHandlingGuard(1_500L)
+        applyPlaybackBufferProfile()
+    }
+
+    /**
+     * После постоянной потери аудиофокуса (другое приложение заняло звук) фокус запрашивается снова
+     * только по действию пользователя. Вызывать без mutex.
+     */
+    private suspend fun regainFocusIfLost(): Boolean {
+        if (!focusLostPermanently) return true
+        if (!reacquireFocusLocked()) return false
+        restoreAudioAfterFocusGain()
+        return true
+    }
+
+    /** То же без перезапуска микрофона — можно вызывать под mutex (toggleMic). */
+    private suspend fun reacquireFocusLocked(): Boolean {
+        if (!focusLostPermanently) return true
+        val granted = withContext(Dispatchers.IO) { audioEngine.reacquireAudioFocus() }
+        if (granted) {
+            focusLostPermanently = false
+            focusHoldSinceMs = 0L
+            audioEngine.setPlaybackHold(PlaybackHoldOwner.FOCUS, false)
+            _state.update { it.copy(error = null) }
+        } else {
+            _state.update { it.copy(error = "Звук сейчас занят (звонок или другое приложение) — попробуйте позже") }
+        }
+        return granted
+    }
+
+    /**
+     * Буферизация вывода: на экране — минимальная задержка ответа; в фоне/при погашенном экране Wi-Fi
+     * работает в power-save и пакеты приходят пачками — нужен запас; читалке задержка старта не важна,
+     * важна непрерывность.
+     */
+    private fun applyPlaybackBufferProfile() {
+        when {
+            sessionProfile == SessionProfile.READER ->
+                audioEngine.setPlaybackBufferProfile(primeMs = 450, minTargetMs = 200, maxTargetMs = 400)
+            !uiVisible || !screenInteractive ->
+                audioEngine.setPlaybackBufferProfile(primeMs = 260, minTargetMs = 80, maxTargetMs = 220)
+            else ->
+                audioEngine.setPlaybackBufferProfile(primeMs = 70, minTargetMs = 40, maxTargetMs = 120)
+        }
+    }
+
+    /** Поднять Live-сессию в профиле READER (или дождаться текущей) — вызывает читалка. */
+    private suspend fun ensureReaderSessionInternal(): Boolean {
+        val needsStart = mutex.withLock {
+            val link = _state.value.link
+            if (sessionProfile == SessionProfile.READER && link != LinkState.IDLE) {
+                false
+            } else {
+                sessionProfile = SessionProfile.READER
+                connectionDesired = true
+                userMicDesired = readerVoiceCommands
+                reconnectAttempts = 0
+                if (link != LinkState.IDLE) {
+                    cancelReconnectWork()
+                    stopInternal(full = false)
+                }
+                resumptionHandle = null
+                try {
+                    startInternal(resume = false)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (t: Throwable) {
+                    logger.e("SessionManager: reader session start failed", t)
+                }
+                true
+            }
+        }
+        if (needsStart) logger.d("SessionManager: Live-сессия переключена в профиль READER")
+        return withTimeoutOrNull(12_000L) {
+            var ready = readerTransport.isSessionReady()
+            while (!ready && _state.value.link != LinkState.IDLE) {
+                delay(50L)
+                ready = readerTransport.isSessionReady()
+            }
+            ready
+        } == true
+    }
+
+    /** Новая сессия без resumption (обход повторяющихся «немых» ответов gemini-3.8-live). */
+    private fun requestFreshSessionInternal(reason: String) {
+        scope.launch {
+            mutex.withLock {
+                if (!connectionDesired || _state.value.link == LinkState.IDLE) return@withLock
+                resumptionHandle = null
+                activeConnectUsedResumption = false
+                resumptionPersistenceMutex.withLock {
+                    dataStore.edit {
+                        it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                        it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                    }
+                }
+            }
+            logger.w("SessionManager: новая сессия без resumption — $reason")
+            scheduleReconnect(reason, client.epoch, immediate = true)
         }
     }
 
@@ -315,7 +657,9 @@ class SessionManager @Inject constructor(
                 val changed = _state.value.activePrompt != newPrompt
                 if (!changed) return@withLock
 
-                val shouldRestart = _state.value.link != LinkState.IDLE
+                // В профиле READER роль ассистента не используется — переподключение не нужно
+                val shouldRestart = _state.value.link != LinkState.IDLE &&
+                    sessionProfile == SessionProfile.CONVERSATION
                 runCatching { dataStore.edit { it[KEY_SYSTEM_PROMPT] = newPrompt } }
                     .onFailure { logger.e("SessionManager: не удалось сохранить промпт", it) }
                 _state.update { it.copy(activePrompt = newPrompt) }
@@ -361,7 +705,11 @@ class SessionManager @Inject constructor(
                 val trimmed = text.trim()
                 if (trimmed.isEmpty() && uris.isEmpty()) return@withLock
 
-                if (_state.value.isAiSpeaking) {
+                if (readerActive()) {
+                    // Вопрос диктору текстом во время чтения: чтение на паузу (прочитанное в буфере
+                    // сохраняется), ответ модели звучит сразу, продолжение — по команде
+                    reader.pause(PauseReason.USER)
+                } else if (_state.value.isAiSpeaking) {
                     invalidateAndFlushAudio("user text")
                     _state.update { it.copy(isAiSpeaking = false) }
                 }
@@ -383,12 +731,25 @@ class SessionManager @Inject constructor(
 
                 isTextTurnInProgress.set(true)
                 try {
-                    client.sendRealtimeText(trimmed)
+                    sendUserText(trimmed)
                 } finally {
                     delay(300L)
                     isTextTurnInProgress.set(false)
                 }
             }
+        }
+    }
+
+    /**
+     * Текстовая реплика пользователя. Для 3.8 — clientContent(turnComplete=true): упорядоченно добавляется
+     * в контекст и сразу запускает ответ (realtimeInput.text порядок не гарантирует).
+     */
+    private suspend fun sendUserText(text: String) {
+        lastUserTurnEndMs = SystemClock.elapsedRealtime()
+        if (activeLiveCapabilities.supportsMidSessionClientContent) {
+            client.sendClientContent(listOf(ClientTurn(ClientRole.USER, text)), turnComplete = true)
+        } else {
+            client.sendRealtimeText(text)
         }
     }
 
@@ -518,7 +879,7 @@ class SessionManager @Inject constructor(
 
                     isTextTurnInProgress.set(true)
                     try {
-                        client.sendRealtimeText(a.fullText.take(15000))
+                        sendUserText(a.fullText.take(15000))
                     } finally {
                         delay(300L)
                         isTextTurnInProgress.set(false)
@@ -686,7 +1047,7 @@ class SessionManager @Inject constructor(
         return out.toList()
     }
 
-    private suspend fun startInternal(resume: Boolean) {
+    private suspend fun startInternal(resume: Boolean, preservePlayback: Boolean = false) {
         if (!resume) {
             resumptionHandle = null
         } else if (resumptionHandle.isNullOrBlank()) {
@@ -750,10 +1111,16 @@ class SessionManager @Inject constructor(
             return
         }
 
-        val liveModel = prefs[KEY_LIVE_MODEL]
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_LIVE_MODEL
+        // Чтение вслух — всегда базовая gemini-3.8-live: минимальная задержка, SILENT-ответы функций
+        // управления, без пауз на размышление (extended-thinking — для сложного диалога)
+        val liveModel = if (sessionProfile == SessionProfile.READER) {
+            READER_LIVE_MODEL
+        } else {
+            prefs[KEY_LIVE_MODEL]
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: DEFAULT_LIVE_MODEL
+        }
 
         val liveCapabilities = LiveModelCapabilitiesRegistry.forModel(liveModel)
         activeLiveCapabilities = liveCapabilities
@@ -774,13 +1141,22 @@ class SessionManager @Inject constructor(
                 null
             }
 
-        val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
+        val readerProfile = sessionProfile == SessionProfile.READER
+        val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: DEFAULT_VOICE
         val speechLang = prefs[KEY_SPEECH_LANGUAGE]?.ifBlank { "ru-RU" } ?: "ru-RU"
-        val temperature = prefs[KEY_TEMPERATURE] ?: 1.0f
+        sessionSpeechLanguage = speechLang
+        // Gemini 3: Google настоятельно рекомендует 1.0 — ниже риск зацикливания и «немых» ходов
+        val temperature = if (readerProfile) 1.0f else prefs[KEY_TEMPERATURE] ?: 1.0f
         val mediaResolution = prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
+        readerVoiceCommands = prefs[KEY_READER_VOICE_COMMANDS] ?: true
+        if (readerProfile && prefs[KEY_READER_PACE] != null) {
+            reader.setPace(ReaderPace.from(prefs[KEY_READER_PACE]))
+        }
+        currentVolume = prefs[KEY_VOLUME] ?: 1.0f
 
         val inputTx = TranscriptionSettings(
-            enabled = prefs[KEY_INPUT_TRANSCRIPTION_ENABLED] ?: true,
+            // Читалке нужна транскрипция реплик слушателя (резервное распознавание команд)
+            enabled = readerProfile || (prefs[KEY_INPUT_TRANSCRIPTION_ENABLED] ?: true),
             languageCodes =
                 prefs[KEY_INPUT_TRANSCRIPTION_LANGUAGES]
                     ?.split(",")
@@ -797,7 +1173,9 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_INPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
-        currentOutputTranscriptionEnabled = prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true
+        // Читалке выходная транскрипция обязательна: по ней проверяется, что фрагмент прочитан целиком,
+        // и вычисляется позиция для продолжения; сторож «немых» ходов 3.8 тоже опирается на неё
+        currentOutputTranscriptionEnabled = readerProfile || (prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true)
 
         val outputTx = TranscriptionSettings(
             enabled = currentOutputTranscriptionEnabled,
@@ -817,29 +1195,48 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
-        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: false
+        // Читалка: только ручной VAD (activityStart/End по локальному Silero) — серверный VAD 3.8
+        // не завершает ход без непрерывного аудиопотока
+        val aadEnabled = !readerProfile && (prefs[KEY_AAD_ENABLED] ?: false)
         currentAadEnabled = aadEnabled
         audioEngine.isAadMode = aadEnabled
-        audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
+        audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: DEFAULT_BT_HIFI)
 
         val realtimeInput = RealtimeInputSettings(
             aadEnabled = aadEnabled,
             startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
             endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
             prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 800,
-            activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: DEFAULT_SILENCE_DURATION_MS,
+            // Читалка: реплика слушателя не обрывает уже начатый фрагмент — он дочитывается в буфер,
+            // а звук мгновенно удерживается локально; команда выполняется сразу после
+            activityHandling = if (readerProfile) "NO_INTERRUPTION"
+                else prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
             turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
+        currentServerSilenceMs = (realtimeInput.silenceDurationMs + 200).coerceAtMost(3000)
 
         audioEngine.setEndOfSpeechHangoverMs(realtimeInput.silenceDurationMs)
-        audioEngine.localBargeInEnabled = realtimeInput.activityHandling != "NO_INTERRUPTION"
+        audioEngine.bargeInMode = if (readerProfile) BargeInMode.HOLD else BargeInMode.FLUSH
+        audioEngine.localBargeInEnabled = readerProfile || realtimeInput.activityHandling != "NO_INTERRUPTION"
+        client.flushPlaybackOnServerInterrupt = !readerProfile
+        applyPlaybackBufferProfile()
+        turnWatchdog.reset()
+        _state.update { it.copy(profile = sessionProfile) }
 
-        val compression = CompressionSettings(
-            enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
-            triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 32_000,
-            targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 16_000
-        )
+        val compression = if (readerProfile) {
+            CompressionSettings(
+                enabled = true,
+                triggerTokens = READER_COMPRESSION_TRIGGER_TOKENS,
+                targetTokens = READER_COMPRESSION_TARGET_TOKENS
+            )
+        } else {
+            CompressionSettings(
+                enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
+                triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 32_000,
+                targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 16_000
+            )
+        }
 
         val resumptionEnabled = prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
         val maxHistoryTurns = prefs[KEY_INITIAL_HISTORY_TURNS] ?: 20
@@ -889,13 +1286,19 @@ class SessionManager @Inject constructor(
             )
         }
 
-        val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
-        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
+        val forvoEnabled = !readerProfile && (prefs[KEY_ENABLE_FORVO] ?: false)
+        val searchEnabled = !readerProfile && (prefs[KEY_ENABLE_SEARCH] ?: false)
 
-        val dynamicTools = if (forvoEnabled) {
-            buildJsonArray { add(buildForvoToolDeclaration()) }
+        val dynamicTools = when {
+            readerProfile -> ReaderPrompts.toolDeclarations()
+            forvoEnabled -> buildJsonArray { add(buildForvoToolDeclaration()) }
+            else -> null
+        }
+
+        val systemInstruction = if (readerProfile) {
+            ReaderPrompts.narratorInstruction(speechLang)
         } else {
-            null
+            buildSystemInstruction(_state.value.activePrompt, speechLang)
         }
 
         try {
@@ -903,7 +1306,7 @@ class SessionManager @Inject constructor(
                 LiveConfig(
                     apiKey = apiKey,
                     model = liveModel,
-                    systemInstruction = buildSystemInstruction(_state.value.activePrompt, speechLang),
+                    systemInstruction = systemInstruction,
                     voiceName = voice,
                     speechLanguage = speechLang,
                     temperature = temperature,
@@ -919,15 +1322,19 @@ class SessionManager @Inject constructor(
                     resumptionHandle = if (resume && resumptionEnabled) resumptionHandle else null,
                     toolsJson = dynamicTools,
                     enableGoogleSearch = searchEnabled,
-                    initialHistory = if (resume) emptyList() else recentHistory(maxHistoryTurns)
+                    initialHistory = if (resume || readerProfile) emptyList() else recentHistory(maxHistoryTurns)
                 ),
                 beforeOpen = {
                     activeSessionId = client.sessionId
                     interactionStatus = null
                     turnCompleteSeen = false
-                    invalidateAndFlushAudio(
-                        if (resume) "Live reconnect" else "Live session start"
-                    )
+                    // Переподключение (goAway, обрыв сети, смена сессии) не стирает уже принятый звук:
+                    // дочитывается/договаривается то, что пришло до разрыва
+                    if (!preservePlayback) {
+                        invalidateAndFlushAudio(
+                            if (resume) "Live reconnect" else "Live session start"
+                        )
+                    }
                 }
             )
         } catch (cancelled: CancellationException) {
@@ -1035,6 +1442,9 @@ class SessionManager @Inject constructor(
             } catch (t: Throwable) {
                 logger.e("SessionManager: playback flush during shutdown failed", t)
             }
+
+            releaseHeldInteractionFrames()
+            turnWatchdog.reset()
 
             isManualActivityActive.set(false)
             isTextTurnInProgress.set(false)
@@ -1187,12 +1597,14 @@ class SessionManager @Inject constructor(
 
                     if (!immediate) {
                         val baseDelay = minOf(
-                            400L * (1L shl (attempt - 1).coerceAtMost(4)),
-                            6000L
+                            400L * (1L shl (attempt - 1).coerceAtMost(6)),
+                            MAX_RECONNECT_BACKOFF_MS
                         )
 
                         val jitteredDelay = (baseDelay * (0.8 + Math.random() * 0.4)).toLong()
-                        delay(jitteredDelay)
+                        // Сеть вернулась (выход из лифта, смена Wi-Fi/LTE) — не ждём конца паузы
+                        networkAvailableSignal.tryReceive()
+                        withTimeoutOrNull(jitteredDelay) { networkAvailableSignal.receive() }
                     }
 
                     if (
@@ -1212,7 +1624,7 @@ class SessionManager @Inject constructor(
                             _state.value.link != LinkState.IDLE
                         ) {
                             val useResume = resumptionHandle != null
-                            startInternal(resume = useResume)
+                            startInternal(resume = useResume, preservePlayback = true)
 
                             synchronized(reconnectGuard) {
                                 if (token == reconnectToken.get()) {
@@ -1356,6 +1768,14 @@ class SessionManager @Inject constructor(
 
                         is MicEvent.Control -> when (event.event) {
                             is AudioStreamControlEvent.SpeechStart -> {
+                                if (readerActive()) {
+                                    reader.onUserSpeechStart()
+                                } else {
+                                    // Новая реплика пользователя снимает ручную паузу ответа (кнопка гарнитуры)
+                                    // и удержание перебивания, если читалка уже не активна
+                                    audioEngine.setPlaybackHold(PlaybackHoldOwner.USER, false)
+                                    audioEngine.setPlaybackHold(PlaybackHoldOwner.BARGE_IN, false)
+                                }
                                 if (!currentAadEnabled && client.isReady) {
                                     isManualActivityActive.set(true)
                                     manualActivityStartedAtMs = android.os.SystemClock.elapsedRealtime()
@@ -1365,13 +1785,21 @@ class SessionManager @Inject constructor(
                             }
 
                             is AudioStreamControlEvent.SpeechEnd -> {
-                                logger.d("SessionManager: VAD SpeechEnd -> ${if (currentAadEnabled) "тишина + audioStreamEnd" else "activityEnd"} (ушло ${client.getTransportAudioStats().outboundMicBytesDelivered / 32} мс аудио за сессию)")
+                                lastUserTurnEndMs = android.os.SystemClock.elapsedRealtime()
+                                if (readerActive()) reader.onUserSpeechEnd()
+                                logger.d("SessionManager: VAD SpeechEnd -> ${if (currentAadEnabled) "тишина в потоке" else "activityEnd"} (ушло ${client.getTransportAudioStats().outboundMicBytesDelivered / 32} мс аудио за сессию)")
                                 if (currentAadEnabled && client.isReady) {
                                     // Серверный VAD видит конец фразы только по тишине в самом аудиопотоке, а локальный
-                                    // VAD обрывает поток сразу после фразы. Без досылки тишины сервер навсегда остаётся
-                                    // в состоянии «пользователь говорит» и не отвечает. 100 × 20 мс = 2 с.
-                                    repeat(100) { client.sendAudioPcm(trailingSilenceFrame, trailingSilenceFrame.size) }
-                                    client.sendAudioStreamEnd()
+                                    // VAD обрывает поток сразу после фразы. gemini-3.8-live вдобавок игнорирует
+                                    // audioStreamEnd: без досылки тишины длиннее порога сервера ход «зависает»
+                                    // (модель молчит). Досылаем порог + 0,7 с тишины кадрами по 20 мс.
+                                    val trailingFrames = ((currentServerSilenceMs + 700) / 20).coerceIn(60, 160)
+                                    repeat(trailingFrames) { client.sendAudioPcm(trailingSilenceFrame, trailingSilenceFrame.size) }
+                                    if (activeLiveCapabilities.endsTurnOnAudioStreamEnd) {
+                                        client.sendAudioStreamEnd()
+                                    } else {
+                                        client.flushAudio()
+                                    }
                                 } else if (!currentAadEnabled && client.isReady) {
                                     isManualActivityActive.set(false)
                                     withTimeoutOrNull(500L) {
@@ -1429,33 +1857,57 @@ class SessionManager @Inject constructor(
         _state.update { it.copy(isMicActive = false) }
     }
 
+    /**
+     * Звук модели проходит два этапа:
+     *  1) классификация сразу при приёме (сторож 3.8, решения читалки) — никогда не блокируется;
+     *  2) подача в нативную очередь отдельным потребителем [observePlaybackFeed] через [playQueue].
+     * Раньше это был один цикл: во время паузы чтения он стоял на заполненной очереди, и ответ модели
+     * на вопрос слушателя застревал за ним — пауза «не отпускала».
+     */
     private fun observeAudio() = scope.launch {
+        launch { observePlaybackFeed() }
         while (isActive) {
             try {
                 for (frame in client.audio) {
                     if (!isActive) break
 
+                    var release = true
                     try {
                         if (frame.sessionId != client.sessionId) continue
                         if (frame.epoch != client.epoch) continue
-                        if (frame.generation != audioEngine.currentPlaybackGeneration) continue
 
-                        val now = SystemClock.elapsedRealtime()
-                        if (frame.isExpired(now)) {
-                            logger.w("SessionManager: Сброшен просроченный аудиофрейм (${now - frame.timestampMs} ms > TTL ${frame.ttlMs} ms)")
-                            continue
+                        turnWatchdog.onAudio(frame.serverTurnId, frame.pcm, frame.pcm.size)
+
+                        if (sessionProfile == SessionProfile.READER) {
+                            synchronized(heldInteractionFrames) {
+                                val decision = reader.decideAudio(frame.serverTurnId, frame.pcm, frame.pcm.size)
+                                // Решение по ходу могло определиться только что (этим кадром): сначала
+                                // уходят придержанные ранее кадры, затем текущий — порядок звука сохраняется
+                                resolveHeldInteractionFramesLocked()
+                                when (decision) {
+                                    AudioDecision.DROP -> Unit
+                                    AudioDecision.HOLD -> {
+                                        heldInteractionFrames.addLast(frame)
+                                        release = false
+                                    }
+                                    AudioDecision.PLAY -> {
+                                        if (heldInteractionFrames.any { it.serverTurnId == frame.serverTurnId }) {
+                                            heldInteractionFrames.addLast(frame)
+                                            release = false
+                                        } else {
+                                            if (reader.shouldAdopt(frame.serverTurnId)) {
+                                                frame.generation = audioEngine.currentPlaybackGeneration
+                                            }
+                                            release = !enqueueForPlayback(frame)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            release = !enqueueForPlayback(frame)
                         }
-
-                        if (!_state.value.isAiSpeaking) {
-                            _state.update { it.copy(isAiSpeaking = true) }
-                        }
-
-                        audioEngine.enqueuePlayback(
-                            frame.pcm,
-                            frame.generation
-                        )
                     } finally {
-                        client.releaseAudio(frame)
+                        if (release) client.releaseAudio(frame)
                     }
                 }
 
@@ -1477,8 +1929,200 @@ class SessionManager @Inject constructor(
         }
     }
 
+    private fun enqueueForPlayback(frame: AudioFrame): Boolean {
+        val accepted = playQueue.trySend(frame).isSuccess
+        if (accepted) playQueueDepth.incrementAndGet()
+        return accepted
+    }
+
+    private suspend fun observePlaybackFeed() {
+        for (frame in playQueue) {
+            playQueueDepth.decrementAndGet()
+            try {
+                feedPlayback(frame)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                logger.e("SessionManager: playback feed failed", t)
+            } finally {
+                client.releaseAudio(frame)
+            }
+        }
+    }
+
+    private suspend fun feedPlayback(frame: AudioFrame) {
+        // Кадры из прежнего соединения доигрываются (уже принятый звук); отсекаются только сброшенные
+        if (frame.generation != audioEngine.currentPlaybackGeneration) return
+
+        val now = SystemClock.elapsedRealtime()
+        if (frame.isExpired(now)) {
+            logger.w("SessionManager: Сброшен просроченный аудиофрейм (${now - frame.timestampMs} ms > TTL ${frame.ttlMs} ms)")
+            return
+        }
+
+        if (!_state.value.isAiSpeaking) {
+            _state.update { it.copy(isAiSpeaking = true) }
+        }
+
+        val before = audioEngine.enqueuedFramesInGeneration
+        audioEngine.enqueuePlayback(frame.pcm, frame.generation)
+        if (sessionProfile == SessionProfile.READER) {
+            val written = audioEngine.enqueuedFramesInGeneration - before
+            if (written > 0L) reader.onAudioEnqueued(frame.serverTurnId, written)
+        }
+    }
+
+    /** Вызывается под lock(heldInteractionFrames). */
+    private fun resolveHeldInteractionFramesLocked() {
+        while (heldInteractionFrames.isNotEmpty()) {
+            val head = heldInteractionFrames.first()
+            when (reader.interactionDecision(head.serverTurnId)) {
+                AudioDecision.HOLD -> return
+                AudioDecision.DROP -> {
+                    heldInteractionFrames.removeFirst()
+                    client.releaseAudio(head)
+                }
+                AudioDecision.PLAY -> {
+                    heldInteractionFrames.removeFirst()
+                    if (reader.shouldAdopt(head.serverTurnId)) {
+                        head.generation = audioEngine.currentPlaybackGeneration
+                    }
+                    if (!enqueueForPlayback(head)) client.releaseAudio(head)
+                }
+            }
+        }
+    }
+
+    private fun observeHeldInteractionFrames() = scope.launch {
+        while (isActive) {
+            delay(100L)
+            synchronized(heldInteractionFrames) { resolveHeldInteractionFramesLocked() }
+        }
+    }
+
+    private fun releaseHeldInteractionFrames() {
+        synchronized(heldInteractionFrames) {
+            while (heldInteractionFrames.isNotEmpty()) client.releaseAudio(heldInteractionFrames.removeFirst())
+        }
+    }
+
+    /** Сторож «немых» и «беглых» ходов 3.8: проверка каждые 250 мс. */
+    private fun observeTurnWatchdog() = scope.launch {
+        while (isActive) {
+            delay(250L)
+            if (!connectionDesired || _state.value.link != LinkState.LIVE) continue
+            val verdict = turnWatchdog.check() ?: continue
+            when (verdict) {
+                is LiveTurnWatchdog.Verdict.SilentTurn -> handleSilentTurn(verdict)
+                is LiveTurnWatchdog.Verdict.Runaway -> {
+                    logger.w("SessionManager: сервер шлёт тишину после конца ответа (ход ${verdict.turnId}) — остаток отбрасывается")
+                    if (!(readerActive() && reader.isReadTurn(verdict.turnId))) {
+                        client.suppressActiveServerGeneration()
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun handleSilentTurn(verdict: LiveTurnWatchdog.Verdict.SilentTurn) {
+        logger.w("SessionManager: «немой» ход ${verdict.turnId}: текст без звука (${verdict.transcript.length} симв.) — восстановление")
+        if (readerActive() && reader.isReadTurn(verdict.turnId)) {
+            reader.onSilentReadTurn(verdict.turnId, verdict.voicedTranscriptLength)
+            return
+        }
+        if (sessionProfile == SessionProfile.READER) return
+
+        // Разговор: остаток генерации не играем и просим модель повторить ответ (clientContent с
+        // turnComplete=true прерывает «зависший» ход — обход, подтверждённый на форуме Google)
+        client.suppressActiveServerGeneration()
+        val now = SystemClock.elapsedRealtime()
+        val fresh = synchronized(silentRecoveryTimes) {
+            silentRecoveryTimes.addLast(now)
+            while (silentRecoveryTimes.isNotEmpty() && now - silentRecoveryTimes.first() > 90_000L) {
+                silentRecoveryTimes.removeFirst()
+            }
+            silentRecoveryTimes.size >= 2
+        }
+        if (fresh) {
+            synchronized(silentRecoveryTimes) { silentRecoveryTimes.clear() }
+            pendingSilentNudge = true
+            requestFreshSessionInternal("повторный «немой» ответ gemini-3.8-live")
+        } else if (client.isReady) {
+            sendUserText(ReaderPrompts.silentTurnNudge(sessionSpeechLanguage))
+        }
+    }
+
+    /**
+     * Документ дочитан или чтение остановлено, а сессия READER ещё открыта (микрофон для голосовых команд,
+     * WebSocket, foreground-сервис): через 10 минут простоя она закрывается — батарея и трафик.
+     * Новое «Читать» поднимет сессию заново автоматически.
+     */
+    private fun observeReaderIdle() = scope.launch {
+        var idleSince = 0L
+        while (isActive) {
+            delay(5_000L)
+            val readerProfileIdle = sessionProfile == SessionProfile.READER &&
+                _state.value.link != LinkState.IDLE && !reader.isActive
+            if (!readerProfileIdle) {
+                idleSince = 0L
+                continue
+            }
+            val playing = audioEngine.pendingModelFrames() > 0L || client.isGenerationInProgress
+            if (!playing && _state.value.isAiSpeaking) _state.update { it.copy(isAiSpeaking = false) }
+            if (playing || audioEngine.isUplinkActive) {
+                idleSince = 0L
+                continue
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (idleSince == 0L) {
+                idleSince = now
+                continue
+            }
+            if (now - idleSince < READER_IDLE_DISCONNECT_MS) continue
+            idleSince = 0L
+            commandMutex.withLock {
+                mutex.withLock {
+                    if (sessionProfile == SessionProfile.READER && !reader.isActive && _state.value.link != LinkState.IDLE) {
+                        logger.d("SessionManager: читалка простаивает ${READER_IDLE_DISCONNECT_MS / 60_000} мин — сессия закрыта")
+                        connectionDesired = false
+                        userMicDesired = false
+                        stopInternal(full = true)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Сеть снова доступна — ускоряем переподключение (не ждём конца backoff). */
+    private fun observeNetwork() {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (connectionDesired && _state.value.link == LinkState.RECONNECTING) {
+                        logger.d("SessionManager: сеть доступна — немедленное переподключение")
+                        networkAvailableSignal.trySend(Unit)
+                    }
+                }
+            })
+        }.onFailure { logger.w("SessionManager: NetworkCallback не зарегистрирован: ${it.message}") }
+    }
+
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
+            if (sessionProfile == SessionProfile.READER) {
+                // Читалка: перебивание = мгновенное удержание вывода (BargeInMode.HOLD), прочитанное
+                // не сбрасывается; дальше решает LiveReaderController (onUserSpeechStart)
+                if (!reader.isActive) {
+                    // Документ не читается (дочитан/остановлен), а сессия ещё в профиле READER:
+                    // перебивание работает как в разговоре, удержание не должно «залипнуть»
+                    audioEngine.setPlaybackHold(PlaybackHoldOwner.BARGE_IN, false)
+                    client.suppressActiveServerGeneration()
+                    invalidateAndFlushAudio("barge-in (reader idle)")
+                    _state.update { it.copy(isAiSpeaking = false) }
+                }
+                return@collect
+            }
             if (!_state.value.isAiSpeaking) return@collect
             _state.update {
                 it.copy(isAiSpeaking = false)
@@ -1488,45 +2132,74 @@ class SessionManager @Inject constructor(
         }
     }
 
+    /**
+     * Аудиофокус. Раньше любая потеря фокуса (уведомление, навигатор, голосовой помощник, звонок)
+     * СБРАСЫВАЛА принятый звук — модель «глохла» посреди фразы и не возвращалась. Теперь вывод
+     * только удерживается (жёсткая пауза в нативном движке) и продолжается с того же сэмпла.
+     */
     private fun observeFocus() = scope.launch {
         audioEngine.focusEvents.collect { event ->
             when (event) {
                 AudioFocusEvent.Gain -> {
-                    mutex.withLock {
-                        if (connectionDesired && _state.value.link == LinkState.LIVE) {
-                            if (!audioEngine.isPlaying.value) {
-                                runCatching { audioEngine.startPlayback() }
-                                    .onFailure { logger.w("SessionManager: не удалось восстановить playback после AudioFocus gain: ${it.message}") }
-                            }
-                            if (userMicDesired && client.isReady) {
-                                micMutex.withLock {
-                                    if (!_state.value.isMicActive && !audioEngine.isCapturing.value) {
-                                        startMicLocked()
-                                    }
-                                }
-                            }
-                            _state.update { it.copy(error = null) }
+                    val heldForMs = if (focusHoldSinceMs > 0L) SystemClock.elapsedRealtime() - focusHoldSinceMs else 0L
+                    focusHoldSinceMs = 0L
+                    focusLostPermanently = false
+                    // Разговор: ответ, «пролежавший» дольше минуты (звонок), неактуален — не доигрываем
+                    if (sessionProfile == SessionProfile.CONVERSATION && heldForMs > STALE_FOCUS_HOLD_MS) {
+                        client.suppressActiveServerGeneration()
+                        invalidateAndFlushAudio("stale answer after focus loss")
+                        _state.update { it.copy(isAiSpeaking = false) }
+                    }
+                    audioEngine.setPlaybackHold(PlaybackHoldOwner.FOCUS, false)
+                    if (readerActive()) reader.onFocusGain()
+                    restoreAudioAfterFocusGain()
+                }
+                AudioFocusEvent.CanDuck -> {
+                    // Короткий звук другого приложения (уведомление, подсказка навигатора): речь не
+                    // приглушаем, а ставим на паузу — пропущенные слова не теряются
+                    holdForFocus()
+                    if (readerActive()) reader.onFocusLoss(permanent = false)
+                }
+                AudioFocusEvent.LossTransient -> {
+                    holdForFocus()
+                    if (readerActive()) reader.onFocusLoss(permanent = false)
+                    mutex.withLock { micMutex.withLock { stopMicLocked() } }
+                    _state.update { it.copy(error = "Аудио приостановлено: звонок или другое приложение") }
+                }
+                AudioFocusEvent.LossPermanent -> {
+                    holdForFocus()
+                    focusLostPermanently = true
+                    if (readerActive()) reader.onFocusLoss(permanent = true)
+                    mutex.withLock { micMutex.withLock { stopMicLocked() } }
+                    _state.update {
+                        it.copy(error = "Звук занят другим приложением. Нажмите «Продолжить» (или Play на гарнитуре)")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun holdForFocus() {
+        if (focusHoldSinceMs == 0L) focusHoldSinceMs = SystemClock.elapsedRealtime()
+        audioEngine.setPlaybackHold(PlaybackHoldOwner.FOCUS, true)
+    }
+
+    /** Фокус вернулся: перезапуск вывода (если поток закрыт) и микрофона. Вызывать без mutex. */
+    private suspend fun restoreAudioAfterFocusGain() {
+        mutex.withLock {
+            if (connectionDesired && _state.value.link == LinkState.LIVE) {
+                if (!audioEngine.isPlaying.value) {
+                    runCatching { audioEngine.startPlayback() }
+                        .onFailure { logger.w("SessionManager: не удалось восстановить playback после AudioFocus gain: ${it.message}") }
+                }
+                if (userMicDesired && client.isReady) {
+                    micMutex.withLock {
+                        if (!_state.value.isMicActive && !audioEngine.isCapturing.value) {
+                            startMicLocked()
                         }
                     }
                 }
-                AudioFocusEvent.LossPermanent, AudioFocusEvent.LossTransient -> {
-                    mutex.withLock {
-                        micMutex.withLock {
-                            stopMicLocked()
-                        }
-                        invalidateAndFlushAudio("audio focus loss")
-                        _state.update {
-                            it.copy(
-                                isAiSpeaking = false,
-                                error = if (event == AudioFocusEvent.LossTransient) {
-                                    "Аудио временно прервано другим приложением или вызовом"
-                                } else {
-                                    "Аудио прервано потерей аудиофокуса"
-                                }
-                            )
-                        }
-                    }
-                }
+                _state.update { it.copy(error = null) }
             }
         }
     }
@@ -1559,6 +2232,8 @@ class SessionManager @Inject constructor(
                         }
 
                         is GeminiEvent.InputTranscript -> {
+                            // Резервное распознавание голосовых команд читалки (если модель не вызвала функцию)
+                            if (readerActive()) reader.onUserTranscript(event.text, event.interim)
                             appendTranscript(
                                 ClientRole.USER,
                                 event.text,
@@ -1568,14 +2243,25 @@ class SessionManager @Inject constructor(
                         }
 
                         is GeminiEvent.OutputTranscript -> {
-                            recordTranscriptGeneration(envelope.generationId)
+                            turnWatchdog.onTranscript(envelope.generationId, event.text)
+                            val readTurn = if (sessionProfile == SessionProfile.READER) {
+                                reader.onModelTranscript(envelope.generationId, event.text, event.turnAudioBytes)
+                                reader.isReadTurn(envelope.generationId)
+                            } else {
+                                false
+                            }
+                            // Прочитанный документ в чат не дублируется (он уже на экране и в памяти читалки);
+                            // ответы диктора на вопросы — показываются
+                            if (!readTurn) {
+                                recordTranscriptGeneration(envelope.generationId)
 
-                            appendTranscript(
-                                ClientRole.MODEL,
-                                event.text,
-                                false,
-                                envelope.generationId
-                            )
+                                appendTranscript(
+                                    ClientRole.MODEL,
+                                    event.text,
+                                    false,
+                                    envelope.generationId
+                                )
+                            }
                         }
 
                         is GeminiEvent.Usage -> {
@@ -1622,6 +2308,15 @@ class SessionManager @Inject constructor(
                                             micMutex.withLock {
                                                 startMicLocked()
                                             }
+                                        }
+
+                                        if (sessionProfile == SessionProfile.READER) {
+                                            reader.onSessionReady()
+                                        } else if (pendingSilentNudge) {
+                                            // Новая сессия после повторного «немого» ответа: история уже
+                                            // передана (initialHistory) — просим повторить ответ
+                                            pendingSilentNudge = false
+                                            scope.launch { sendUserText(ReaderPrompts.silentTurnNudge(sessionSpeechLanguage)) }
                                         }
                                     }
 
@@ -1693,6 +2388,7 @@ class SessionManager @Inject constructor(
                                             goAwayToken.incrementAndGet()
 
                                         pendingGoAway = true
+                                        logger.d("SessionManager: goAway (осталось ${event.millisLeft ?: 0L} мс) — переподключение в тихий момент")
 
                                         synchronized(reconnectGuard) {
                                             goAwayJob?.cancel()
@@ -1703,7 +2399,7 @@ class SessionManager @Inject constructor(
                                                     val deadline = SystemClock.elapsedRealtime() +
                                                         (millisLeft - 1500L).coerceAtLeast(0L)
                                                     while (SystemClock.elapsedRealtime() < deadline) {
-                                                        if (!_state.value.isAiSpeaking && !audioEngine.isUplinkActive) break
+                                                        if (isQuietMomentForReconnect()) break
                                                         delay(100L)
                                                     }
 
@@ -1746,10 +2442,18 @@ class SessionManager @Inject constructor(
                                     }
 
                                     is GeminiEvent.Interrupted -> {
+                                        lastModelTurnEndMs = SystemClock.elapsedRealtime()
+                                        turnWatchdog.onTurnClosed(envelope.generationId)
                                         audioEngine.resetBargeInState()
 
-                                        _state.update {
-                                            it.copy(isAiSpeaking = false)
+                                        if (sessionProfile == SessionProfile.READER) {
+                                            // Прервана только текущая генерация (новой репликой); уже
+                                            // принятые фрагменты продолжают звучать — читалка дочитает остаток
+                                            reader.onServerInterrupted(envelope.generationId)
+                                        } else {
+                                            _state.update {
+                                                it.copy(isAiSpeaking = false)
+                                            }
                                         }
 
                                         resetTranscriptRuntime()
@@ -1758,14 +2462,28 @@ class SessionManager @Inject constructor(
                                     }
 
                                     is GeminiEvent.GenerationComplete -> {
+                                        if (sessionProfile == SessionProfile.READER) {
+                                            reader.onGenerationComplete(envelope.generationId)
+                                        }
                                     }
 
                                     is GeminiEvent.TurnComplete -> {
-                                        turnCompleteSeen = true
+                                        lastModelTurnEndMs = SystemClock.elapsedRealtime()
+                                        turnWatchdog.onTurnClosed(envelope.generationId)
                                         val capabilities =
                                             clientCapabilitiesForCurrentSession()
 
-                                        if (
+                                        val readTurn = sessionProfile == SessionProfile.READER &&
+                                            reader.isReadTurn(envelope.generationId)
+                                        if (sessionProfile == SessionProfile.READER) {
+                                            reader.onTurnComplete(envelope.generationId)
+                                        }
+
+                                        // Фрагмент чтения — не «реплика»: за ним сразу идёт следующий,
+                                        // индикатор и сброс состояния ответа не нужны
+                                        if (readTurn) {
+                                            turnCompleteSeen = false
+                                        } else if (
                                             !capabilities.supportsInteractionStatus ||
                                             interactionStatus == "IDLE"
                                         ) {
@@ -1837,12 +2555,21 @@ class SessionManager @Inject constructor(
                                         }
 
                                         cancelAllPendingToolJobs()
+                                        turnWatchdog.reset()
+                                        // Фрагмент, генерация которого оборвалась, читалка дочитает после переподключения
+                                        if (sessionProfile == SessionProfile.READER) reader.onSessionLost()
 
                                         val configRejectCodes = setOf(400, 403, 404, 1007, 1008)
                                         val resumeRejected =
                                             activeConnectUsedResumption && event.code in configRejectCodes
 
-                                        if (resumeRejected) {
+                                        // gemini-3.8-live рвёт уже работающие сессии кодом 1008 (форум Google,
+                                        // окт. 2026) — это не ошибка конфигурации: чистая сессия, но не по кругу
+                                        val wasLive = _state.value.link == LinkState.LIVE
+                                        val transientPolicyClose = !resumeRejected && wasLive &&
+                                            event.code == 1008 && allowPolicyCloseRetry()
+
+                                        if (resumeRejected || transientPolicyClose) {
                                             logger.w(
                                                 "SessionManager: Сервер отклонил токен resumption (${event.code}). Сброс кэша и перезапуск чистой сессии."
                                             )
@@ -1858,7 +2585,7 @@ class SessionManager @Inject constructor(
                                             }
                                         }
 
-                                        val authOrClientFatal = !resumeRejected &&
+                                        val authOrClientFatal = !resumeRejected && !transientPolicyClose &&
                                             (event.code == 401 || event.code in configRejectCodes)
 
                                         if (authOrClientFatal) {
@@ -1887,14 +2614,14 @@ class SessionManager @Inject constructor(
 
                                             scheduleReconnect(
                                                 reason =
-                                                    if (resumeRejected) {
-                                                        "resumption отклонён сервером (${event.code}), запуск чистой сессии"
+                                                    if (resumeRejected || transientPolicyClose) {
+                                                        "сервер закрыл сессию (${event.code}), запуск чистой сессии"
                                                     } else {
                                                         "код ${event.code}: ${event.reason.take(120)}"
                                                     },
                                                 sourceEpoch =
                                                     event.epoch,
-                                                immediate = resumeRejected
+                                                immediate = resumeRejected || transientPolicyClose
                                             )
                                         }
                                     }
@@ -1937,6 +2664,33 @@ class SessionManager @Inject constructor(
     private fun clientCapabilitiesForCurrentSession(): LiveModelCapabilities =
         activeLiveCapabilities
 
+    /**
+     * Можно ли переподключиться (goAway) без потерь. Уже принятый звук переживает переподключение
+     * (preservePlayback), поэтому ждём не конца ВОСПРОИЗВЕДЕНИЯ, как раньше, а только конца генерации,
+     * передачи реплики пользователя и ответа на неё. Раньше переподключение приходилось ровно на момент,
+     * когда модель договорила и пользователь начинал отвечать — его первые слова терялись.
+     */
+    private fun isQuietMomentForReconnect(): Boolean {
+        if (client.isGenerationInProgress || client.hasPendingAudioFrames) return false
+        if (audioEngine.isUplinkActive || isManualActivityActive.get() || isTextTurnInProgress.get()) return false
+        if (activeToolJobs.isNotEmpty()) return false
+        val now = SystemClock.elapsedRealtime()
+        // Реплика пользователя ушла, а ответ ещё не начат — переподключение потеряло бы вопрос
+        val awaitingAnswer = lastUserTurnEndMs > lastModelTurnEndMs && now - lastUserTurnEndMs < 8_000L
+        if (awaitingAnswer) return false
+        return sessionProfile != SessionProfile.READER || reader.canReconnectNow()
+    }
+
+    private fun allowPolicyCloseRetry(): Boolean = synchronized(policyCloseTimes) {
+        val now = SystemClock.elapsedRealtime()
+        while (policyCloseTimes.isNotEmpty() && now - policyCloseTimes.first() > 120_000L) {
+            policyCloseTimes.removeFirst()
+        }
+        if (policyCloseTimes.size >= 2) return@synchronized false
+        policyCloseTimes.addLast(now)
+        true
+    }
+
     private fun finishInteractionAfterPlayback(
         sourceSessionId: Long,
         sourceEpoch: Long,
@@ -1947,7 +2701,10 @@ class SessionManager @Inject constructor(
             val generation = audioEngine.currentPlaybackGeneration
 
             val ingressDeadline = SystemClock.elapsedRealtime() + 2500L
-            while (client.hasPendingAudioFrames && SystemClock.elapsedRealtime() < ingressDeadline) {
+            // Звук ещё в пути: в канале транспорта или в очереди подачи в движок
+            while ((client.hasPendingAudioFrames || playQueueDepth.get() > 0) &&
+                SystemClock.elapsedRealtime() < ingressDeadline
+            ) {
                 if (client.sessionId != sourceSessionId || client.epoch != sourceEpoch || !connectionDesired) {
                     return@launch
                 }
@@ -1957,9 +2714,15 @@ class SessionManager @Inject constructor(
             delay(60L)
 
             val drained = audioEngine.awaitPlaybackDrained(generation = generation, stallTimeoutMs = 2500L)
-            if (!drained && audioEngine.currentPlaybackGeneration == generation) {
+            // Активная читалка сама следит за своим буфером: «зависание» здесь — это её законная пауза
+            if (!drained && audioEngine.currentPlaybackGeneration == generation && !readerActive()) {
                 logger.w("SessionManager: playback drain watchdog detected hardware stall; clearing stalled queue")
                 invalidateAndFlushAudio("playback stall recovery")
+            }
+
+            // Ответ доигран: индикатор снимается, даже если за это время сессия переподключилась (goAway)
+            if (client.epoch != sourceEpoch && !client.isGenerationInProgress && audioEngine.pendingModelFrames() == 0L) {
+                _state.update { it.copy(isAiSpeaking = false) }
             }
 
             val shouldReconnect =
@@ -2038,6 +2801,31 @@ class SessionManager @Inject constructor(
                 currentEpoch,
                 callId
             )
+
+            if (ReaderPrompts.isReaderTool(call.name)) {
+                // Управление читалкой: ответ SILENT (модель не комментирует команду), затем выполнение —
+                // в этом порядке, чтобы следующий фрагмент не обогнал toolResponse
+                client.sendToolResponses(
+                    listOf(
+                        ToolResponse(
+                            name = call.name,
+                            id = callId,
+                            response = ReaderPrompts.okResult(),
+                            scheduling = if (clientCapabilitiesForCurrentSession().supportsFunctionScheduling) {
+                                FunctionResponseScheduling.SILENT
+                            } else {
+                                null
+                            }
+                        )
+                    )
+                )
+                if (sessionProfile == SessionProfile.READER) {
+                    // Здесь удерживается mutex: только вариант без перезапуска микрофона
+                    if (call.name == ReaderPrompts.TOOL_RESUME) reacquireFocusLocked()
+                    reader.onToolCall(call.name, call.args)
+                }
+                continue
+            }
 
             if (call.name != "lookup_pronunciation") {
                 client.sendToolResponses(
@@ -2401,9 +3189,12 @@ class SessionManager @Inject constructor(
                     _state.update { it.copy(activePrompt = stored) }
                 }
             }
-            audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
+            currentVolume = prefs[KEY_VOLUME] ?: 1.0f
+            audioEngine.setVolume(currentVolume)
             audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
-            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
+            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: DEFAULT_BT_HIFI)
+            readerVoiceCommands = prefs[KEY_READER_VOICE_COMMANDS] ?: true
+            if (!reader.isActive) prefs[KEY_READER_PACE]?.let { reader.setPace(ReaderPace.from(it)) }
             if (prefs[KEY_SESSION_RESUMPTION_ENABLED] == false) {
                 val hasStoredHandle = !prefs[KEY_SESSION_RESUMPTION_HANDLE].isNullOrBlank()
                 val hasStoredTimestamp = prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
@@ -2468,3 +3259,4 @@ class SessionManager @Inject constructor(
         }
     }
 }
+
