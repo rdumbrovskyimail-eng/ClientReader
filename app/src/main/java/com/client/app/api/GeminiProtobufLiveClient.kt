@@ -188,7 +188,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         timestampMs: Long,
         sequenceNumber: Long,
         timestampNs: Long,
-        ttlMs: Long
+        ttlMs: Long,
+        serverTurnId: Long
     ): AudioFrame = synchronized(audioFramePoolLock) {
         if (audioFramePool.isNotEmpty()) {
             val f = audioFramePool.removeFirst()
@@ -201,11 +202,30 @@ class GeminiProtobufLiveClient @Inject constructor(
             f.sequenceNumber = sequenceNumber
             f.timestampNs = timestampNs
             f.ttlMs = ttlMs
+            f.serverTurnId = serverTurnId
             f
         } else {
-            AudioFrame(pcm, sessionId, epoch, generation, frameId, timestampMs, sequenceNumber, timestampNs, ttlMs)
+            AudioFrame(pcm, sessionId, epoch, generation, frameId, timestampMs, sequenceNumber, timestampNs, ttlMs, serverTurnId)
         }
     }
+
+    /** Сервер сейчас генерирует ход (между первым modelTurn и turnComplete/interrupted). */
+    val isGenerationInProgress: Boolean
+        get() = synchronized(sessionStateLock) { serverGenerationOpen }
+
+    val activeServerTurnId: Long
+        get() = synchronized(sessionStateLock) { activeServerGenerationId }
+
+    /** Принятое из сети аудио текущей сессии, ещё не переданное в движок (байт, 24 кГц × 16 бит). */
+    fun pendingTransportAudioBytes(): Long =
+        audioBudgetBySession[DataBudgetKey(sessionId, epoch)]?.get()?.coerceAtLeast(0L) ?: 0L
+
+    /**
+     * Сбрасывать ли локальное воспроизведение по `interrupted` от сервера. В разговоре — да (модель
+     * замолкает). В читалке — нет: прерывается только текущая генерация, а уже принятые фрагменты
+     * текста продолжают звучать (иначе каждая служебная реплика стирала бы десятки секунд чтения).
+     */
+    @Volatile var flushPlaybackOnServerInterrupt: Boolean = true
 
     fun getTransportAudioStats(): TransportAudioStats = TransportAudioStats(
         serverAudioFramesReceived = totalServerAudioFramesReceived.get(),
@@ -349,6 +369,8 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val generationIdGen = AtomicLong(0L)
     private var activeServerGenerationId = 0L
     private var serverGenerationOpen = false
+    // Байт аудио, принятых в текущей генерации (guarded by sessionStateLock)
+    private var activeGenerationAudioBytes = 0L
 
     private val _events = Channel<QueuedEvent>(Channel.UNLIMITED)
 
@@ -1045,8 +1067,8 @@ class GeminiProtobufLiveClient @Inject constructor(
     suspend fun sendClientContent(
         turns: List<ClientTurn>,
         turnComplete: Boolean = true
-    ) {
-        if (turns.isEmpty()) return
+    ): Boolean {
+        if (turns.isEmpty()) return false
 
         val jsonMessage = buildJsonObject {
             putJsonObject("clientContent") {
@@ -1065,7 +1087,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         }.toString()
 
         logManager.net("WebSocket:TxClientContent", "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete)")
-        sendOrderedControlJson(jsonMessage, "ClientContent")
+        return sendOrderedControlJson(jsonMessage, "ClientContent")
     }
 
     private fun sendClientContentInternal(
@@ -1309,7 +1331,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 if (cfg.compression.enabled) {
                     val trigger = cfg.compression.triggerTokens
-                    val target = cfg.compression.targetTokens
+                    // targetTokens обязан быть меньше triggerTokens (по умолчанию сервер берёт trigger/2)
+                    val target = cfg.compression.targetTokens.takeIf { trigger <= 0 || it < trigger } ?: 0
 
                     putJsonObject("contextWindowCompression") {
                         if (trigger > 0) put("triggerTokens", trigger)
@@ -1412,9 +1435,13 @@ class GeminiProtobufLiveClient @Inject constructor(
             if (!serverGenerationOpen && modelParts?.isNotEmpty() == true) {
                 activeServerGenerationId = generationIdGen.incrementAndGet()
                 serverGenerationOpen = true
+                activeGenerationAudioBytes = 0L
             }
             activeServerGenerationId
         }
+        // Позиция транскрипта в звуке: аудио этого кадра описывается его же outputTranscription
+        val frameAudioBytes = decodedPcmParts.sumOf { it?.size ?: 0 }.toLong()
+        val transcriptAudioBytes = synchronized(sessionStateLock) { activeGenerationAudioBytes } + frameAudioBytes
 
         fun emitControl(event: GeminiEvent) =
             emitControlEvent(event, myEpoch, frameId, frameGenerationId)
@@ -1521,7 +1548,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
                 if (interrupted) {
                     purgeAudioQueue(-1L)
-                    audioEngine.invalidateAndFlushPlayback("server interrupted")
+                    if (flushPlaybackOnServerInterrupt) {
+                        audioEngine.invalidateAndFlushPlayback("server interrupted")
+                    }
                     serverGenerationOpen = false
                     suppressedServerGenerationId = -1L
                     emitControl(GeminiEvent.Interrupted)
@@ -1541,7 +1570,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     ?.let { emitControl(GeminiEvent.InputTranscript(it, interim = false)) }
                 extractTranscriptText(sc["outputTranscription"])
                     ?.takeIf { it.isNotBlank() && frameGenerationId != suppressedServerGenerationId }
-                    ?.let { emitControl(GeminiEvent.OutputTranscript(it)) }
+                    ?.let { emitControl(GeminiEvent.OutputTranscript(it, transcriptAudioBytes)) }
 
                 if (!interrupted) {
                     sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEachIndexed { partIndex, partEl ->
@@ -1562,6 +1591,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                             totalServerAudioBytesReceived.addAndGet(bytes)
                             totalServerAudioFramesReceived.addAndGet(bytes / 2L)
+                            activeGenerationAudioBytes += bytes
 
                             if (frameGenerationId == suppressedServerGenerationId) return@forEachIndexed
 
@@ -1585,7 +1615,8 @@ class GeminiProtobufLiveClient @Inject constructor(
                                             timestampMs = SystemClock.elapsedRealtime(),
                                             sequenceNumber = frameSeq,
                                             timestampNs = frameNanoTime,
-                                            ttlMs = AUDIO_FRAME_DEFAULT_TTL_MS
+                                            ttlMs = AUDIO_FRAME_DEFAULT_TTL_MS,
+                                            serverTurnId = frameGenerationId
                                         )
 
                                         if (!audioFrame.isExpired()) {
