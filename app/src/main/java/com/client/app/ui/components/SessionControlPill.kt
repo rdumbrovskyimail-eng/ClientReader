@@ -1,250 +1,152 @@
 package com.client.app.ui.components
 
-import android.content.Context
-import android.os.Build
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.*
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.client.app.session.LinkState
-import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
-
-// Чёрная тема: в покое — светлая капсула-призыв, в эфире — графит (жёлтый — подключение, зелёный — эфир)
-private val ColorPillIdle = Color(0xFFF4F4F5)
-private val ColorPillActive = Color(0xFF141416)
-private val ColorHairlineDefault = Color(0xFF2A2A2E)
-private val ColorHairlineLive = Color(0xFF34A853).copy(alpha = 0.55f)
-
-private val ColorTextIdle = Color(0xFF0A0A0A)
-private val ColorTextConnecting = Color(0xFFA1A1AA)
-private val ColorTextLive = Color(0xFFF4F4F5)
-private val ColorLedConnecting = Color(0xFFFBBC04)
-private val ColorLedLive = Color(0xFF34A853)
-
-/** Пульс светодиода только на время подключения: меняется лишь слой, без лишних перекомпозиций. */
-private fun Modifier.connectingPulse(): Modifier = composed {
-    val transition = rememberInfiniteTransition(label = "connecting_pulse")
-    val pulse by transition.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_alpha"
-    )
-    graphicsLayer { alpha = pulse }
-}
+import com.client.app.ui.theme.Calm
+import com.client.app.ui.theme.CalmDurations
 
 /**
- * Тактильный импульс щелчка X-Axis LRA для физического отклика клавиши сессии.
- */
-private fun performTactileClick(context: Context, intensity: Float = 1.0f) {
-    runCatching {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
-            val vibrator = vibratorManager?.defaultVibrator
-            if (vibrator?.hasVibrator() == true) {
-                vibrator.vibrate(
-                    VibrationEffect.startComposition()
-                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, intensity, 0)
-                        .compose()
-                )
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-            if (vibrator?.hasVibrator() == true) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
-                } else {
-                    vibrator.vibrate(20L)
-                }
-            }
-        }
-    }
-}
-
-/**
- * Горизонтальная полукруглая капсула управления голосовой сессией (Start Session / End Session).
- * Располагается под FM-лентой звука, снабжена светодиодом состояния и упругой механической отдачей.
+ * Главная кнопка разговора — единственное основное действие экрана.
+ *
+ * Состояния без тревожных цветов:
+ * - «Начать разговор» — заливка акцентом;
+ * - «Подключаюсь…» — мягкий акцентный полутон и «дышащая» точка, нажатие отменяет;
+ * - «Восстанавливаю связь…» — тёплый песок, нажатие останавливает;
+ * - «Завершить разговор» — нейтральная поверхность (не красная: завершение — обычное действие).
+ *
+ * [quiet] — компактный вариант, когда главным становится чтение (кнопки читалки важнее).
  */
 @Composable
 fun SessionControlPill(
     linkState: LinkState,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    quiet: Boolean = false
 ) {
+    val c = Calm.colors
+    val motion = Calm.motion
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
 
-    // Пружинная механическая отдача при нажатии (легкий толчок вниз)
-    val verticalBump = remember { Animatable(0f) }
-
-    val isConnected = linkState == LinkState.LIVE
-    val isConnecting = linkState == LinkState.CONNECTING || linkState == LinkState.RECONNECTING
-
-    val targetTextColor = when {
-        isConnected -> ColorTextLive
-        isConnecting -> ColorTextConnecting
-        else -> ColorTextIdle
+    val container = when (linkState) {
+        LinkState.IDLE -> if (quiet) c.raisedStrong else c.accent
+        LinkState.CONNECTING -> c.accentSoft
+        LinkState.RECONNECTING -> c.attentionSoft
+        LinkState.LIVE -> c.raisedStrong
     }
-
-    val animatedLedColor by animateColorAsState(
-        targetValue = when {
-            isConnected -> ColorLedLive
-            isConnecting -> ColorLedConnecting
-            else -> ColorTextIdle
-        },
-        animationSpec = tween(durationMillis = 500, easing = FastOutSlowInEasing),
-        label = "session_pill_led_color"
+    val content = when (linkState) {
+        LinkState.IDLE -> if (quiet) c.ink else c.onAccent
+        LinkState.CONNECTING -> c.onAccentSoft
+        LinkState.RECONNECTING -> c.onAttentionSoft
+        LinkState.LIVE -> c.ink
+    }
+    val animatedContainer by animateColorAsState(container, motion.spec(CalmDurations.MEDIUM), label = "pill_bg")
+    val animatedContent by animateColorAsState(content, motion.spec(CalmDurations.MEDIUM), label = "pill_fg")
+    val scale by animateFloatAsState(
+        targetValue = if (pressed && !motion.reduced) 0.98f else 1f,
+        animationSpec = motion.spec(CalmDurations.QUICK),
+        label = "pill_press"
     )
 
-    val animatedTextColor by animateColorAsState(
-        targetValue = targetTextColor,
-        animationSpec = tween(durationMillis = 650, easing = FastOutSlowInEasing),
-        label = "session_pill_text_color"
-    )
+    val (title, caption) = when (linkState) {
+        LinkState.IDLE -> "Начать разговор" to null
+        LinkState.CONNECTING -> "Подключаюсь…" to "нажмите, чтобы отменить"
+        LinkState.RECONNECTING -> "Восстанавливаю связь…" to "нажмите, чтобы остановить"
+        LinkState.LIVE -> (if (quiet) "Завершить сеанс" else "Завершить разговор") to null
+    }
+    val shape = RoundedCornerShape(50)
+    val height = if (quiet) 52.dp else 60.dp
 
-    val animatedBorderColor by animateColorAsState(
-        targetValue = if (isConnected) ColorHairlineLive else ColorHairlineDefault,
-        animationSpec = tween(durationMillis = 500, easing = FastOutSlowInEasing),
-        label = "session_pill_border_color"
-    )
-
-    val animatedPillColor by animateColorAsState(
-        targetValue = if (isConnected || isConnecting) ColorPillActive else ColorPillIdle,
-        animationSpec = tween(durationMillis = 450, easing = FastOutSlowInEasing),
-        label = "session_pill_background"
-    )
-
-    val auraScale by animateFloatAsState(
-        targetValue = if (isConnected) 1.25f else 1.0f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
-        label = "aura_scale"
-    )
-
-    val pillShape = RoundedCornerShape(26.dp)
-
-    Box(
+    Row(
         modifier = modifier
-            .height(52.dp)
-            .offset { IntOffset(0, verticalBump.value.roundToInt()) }
-            .shadow(
-                elevation = if (isConnected) 8.dp else 5.dp,
-                shape = pillShape,
-                ambientColor = if (isConnected) Color(0x1434A853) else Color(0x0F000000),
-                spotColor = if (isConnected) Color(0x2434A853) else Color(0x1A000000)
-            )
-            .clip(pillShape)
-            .background(animatedPillColor)
-            .border(
-                width = 1.dp,
-                color = animatedBorderColor,
-                shape = pillShape
-            )
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null
-            ) {
-                coroutineScope.launch {
-                    performTactileClick(context, intensity = if (isConnected) 0.75f else 1.0f)
-
-                    launch {
-                        verticalBump.animateTo(
-                            targetValue = 4.dp.value,
-                            animationSpec = tween(durationMillis = 100, easing = FastOutSlowInEasing)
-                        )
-                        verticalBump.animateTo(
-                            targetValue = 0f,
-                            animationSpec = spring(
-                                dampingRatio = Spring.DampingRatioMediumBouncy,
-                                stiffness = Spring.StiffnessLow
-                            )
-                        )
-                    }
-
-                    onClick()
+            .heightIn(min = height)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(shape)
+            .background(animatedContainer)
+            .then(if (linkState == LinkState.LIVE) Modifier.border(1.dp, c.hairline, shape) else Modifier)
+            .clickable(interactionSource = interaction, indication = LocalIndication.current, role = Role.Button) {
+                CalmHaptics.confirm(context)
+                onClick()
+            }
+            .semantics {
+                contentDescription = title
+                stateDescription = when (linkState) {
+                    LinkState.IDLE -> "Разговор не начат"
+                    LinkState.CONNECTING -> "Идёт подключение"
+                    LinkState.RECONNECTING -> "Связь восстанавливается"
+                    LinkState.LIVE -> "Разговор идёт"
                 }
-            },
-        contentAlignment = Alignment.Center
+            }
+            .padding(horizontal = 24.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 20.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            // Светодиодный индикатор слева с мягким ореолом
-            Box(
-                modifier = Modifier.size(16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                if (isConnected || isConnecting) {
-                    Box(
-                        modifier = Modifier
-                            .size(14.dp)
-                            .scale(auraScale)
-                            .then(if (isConnecting) Modifier.connectingPulse() else Modifier)
-                            .clip(CircleShape)
-                            .background(animatedLedColor.copy(alpha = 0.24f))
+        when (linkState) {
+            LinkState.IDLE -> Icon(Icons.Rounded.Mic, contentDescription = null, tint = animatedContent, modifier = Modifier.size(22.dp))
+            LinkState.LIVE -> Icon(Icons.Rounded.Stop, contentDescription = null, tint = animatedContent, modifier = Modifier.size(22.dp))
+            LinkState.CONNECTING -> BreathingDot(color = c.accent, size = 10.dp)
+            LinkState.RECONNECTING -> BreathingDot(color = c.attention, size = 10.dp)
+        }
+        Spacer(Modifier.width(12.dp))
+        AnimatedContent(
+            targetState = title to caption,
+            transitionSpec = { fadeIn(motion.fade()) togetherWith fadeOut(motion.fade()) },
+            label = "pill_label"
+        ) { (t, cap) ->
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(text = t, style = MaterialTheme.typography.labelLarge, color = animatedContent)
+                if (cap != null) {
+                    Text(
+                        text = cap,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = animatedContent.copy(alpha = 0.78f),
+                        modifier = Modifier.padding(top = 1.dp)
                     )
                 }
-
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .then(if (isConnecting) Modifier.connectingPulse() else Modifier)
-                        .clip(CircleShape)
-                        .background(animatedLedColor)
-                )
             }
-
-            Spacer(Modifier.width(12.dp))
-
-            // Горизонтальный текст действия
-            val label = when {
-                isConnected -> "END SESSION"
-                isConnecting -> "CONNECTING..."
-                else -> "START SESSION"
-            }
-
-            Text(
-                text = label,
-                color = animatedTextColor,
-                fontSize = 12.5.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace,
-                letterSpacing = 1.2.sp,
-                textAlign = TextAlign.Center
-            )
         }
     }
 }
