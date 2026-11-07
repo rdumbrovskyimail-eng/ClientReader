@@ -2470,6 +2470,7 @@ class SessionManager @Inject constructor(
                                     is GeminiEvent.TurnComplete -> {
                                         lastModelTurnEndMs = SystemClock.elapsedRealtime()
                                         turnWatchdog.onTurnClosed(envelope.generationId)
+                                        turnCompleteSeen = true
                                         val capabilities =
                                             clientCapabilitiesForCurrentSession()
 
