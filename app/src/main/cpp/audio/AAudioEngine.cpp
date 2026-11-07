@@ -67,7 +67,9 @@ void BiquadTdf2::makeLowShelf(double fc, double gainDb, double fs, double S) {
     b1 = (2.0 * A * ((A - 1.0) - (A + 1.0) * cs)) / a0;
     b2 = (A * ((A + 1.0) - (A - 1.0) * cs - beta)) / a0;
     a1 = (-2.0 * ((A - 1.0) + (A + 1.0) * cs)) / a0;
-    a2 = ((A + 1.0) - (A - 1.0) * cs - beta) / a0;
+    // RBJ low-shelf: a2 = (A+1) + (A-1)cos - 2√A·α. Со знаком «−» полюс выходит за единичный круг
+    // (|p|≈1,35) — фильтр неустойчив, звук превращается в перегруз и шум
+    a2 = ((A + 1.0) + (A - 1.0) * cs - beta) / a0;
 }
 
 void BiquadTdf2::makeHighShelf(double fc, double gainDb, double fs, double S) {
@@ -81,7 +83,9 @@ void BiquadTdf2::makeHighShelf(double fc, double gainDb, double fs, double S) {
     const double a0 = (A + 1.0) - (A - 1.0) * cs + beta;
     b0 = (A * ((A + 1.0) + (A - 1.0) * cs + beta)) / a0;
     b1 = (-2.0 * A * ((A - 1.0) + (A + 1.0) * cs)) / a0;
-    b2 = (A * ((A + 1.0) - (A - 1.0) * cs - beta)) / a0;
+    // RBJ high-shelf: b2 = A·((A+1) + (A-1)cos - 2√A·α). Прежний знак «−» давал ±0,2–0,4 дБ
+    // на низких частотах вместо 0 и недобор полки на верхах
+    b2 = (A * ((A + 1.0) + (A - 1.0) * cs - beta)) / a0;
     a1 = (2.0 * ((A - 1.0) - (A + 1.0) * cs)) / a0;
     a2 = ((A + 1.0) - (A - 1.0) * cs - beta) / a0;
 }
