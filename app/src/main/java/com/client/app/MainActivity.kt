@@ -1,5 +1,8 @@
+@file:Suppress("SuspiciousIndentation")
+
 package com.client.app
 
+import android.annotation.SuppressLint
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -59,6 +62,12 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var dataStore: DataStore<Preferences>
 
+    private fun loadInitialPrefs(): UiPrefs = runCatching {
+        runBlocking { withTimeoutOrNull(150L) { dataStore.data.first() } }
+    }.getOrNull()?.toUiPrefs() ?: UiPrefs()
+
+    @SuppressLint("SuspiciousIndentation")
+    @Suppress("SuspiciousIndentation")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -69,91 +78,89 @@ class MainActivity : ComponentActivity() {
         DisplayRateManager.setHighRefreshRate(window, true)
 
         // Тема известна до первого кадра — без «вспышки» не той темы (чтение ограничено 150 мс)
-        val initialPrefs = runCatching {
-            runBlocking { withTimeoutOrNull(150L) { dataStore.data.first() } }
-        }.getOrNull()?.toUiPrefs() ?: UiPrefs()
+        val initialPrefs = loadInitialPrefs()
 
-            setContent {
-                // Повреждённое хранилище не должно ронять интерфейс — тогда просто оформление по умолчанию
-                val uiPrefsFlow = remember { dataStore.data.map { it.toUiPrefs() }.catch { emit(UiPrefs()) } }
-                val prefs by uiPrefsFlow.collectAsStateWithLifecycle(initialValue = initialPrefs)
-                val dark = isCalmDark(prefs)
+        setContent {
+            // Повреждённое хранилище не должно ронять интерфейс — тогда просто оформление по умолчанию
+            val uiPrefsFlow = remember { dataStore.data.map { it.toUiPrefs() }.catch { emit(UiPrefs()) } }
+            val prefs by uiPrefsFlow.collectAsStateWithLifecycle(initialValue = initialPrefs)
+            val dark = isCalmDark(prefs)
 
-                // Светлые значки строки состояния на тёмной теме и тёмные — на светлой
-                LaunchedEffect(dark) {
-                    val transparent = android.graphics.Color.TRANSPARENT
-                    enableEdgeToEdge(
-                        statusBarStyle = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent),
-                        navigationBarStyle = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
-                    )
-                }
+            // Светлые значки строки состояния на тёмной теме и тёмные — на светлой
+            LaunchedEffect(dark) {
+                val transparent = android.graphics.Color.TRANSPARENT
+                enableEdgeToEdge(
+                    statusBarStyle = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent),
+                    navigationBarStyle = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
+                )
+            }
 
-                CalmTheme(prefs = prefs) {
-                    val reduced = Calm.motion.reduced
-                    val canvas = Calm.colors.canvas
-                    LaunchedEffect(canvas) { window.decorView.setBackgroundColor(canvas.toArgb()) }
+            CalmTheme(prefs = prefs) {
+                val reduced = Calm.motion.reduced
+                val canvas = Calm.colors.canvas
+                LaunchedEffect(canvas) { window.decorView.setBackgroundColor(canvas.toArgb()) }
 
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(canvas)
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(canvas)
+                ) {
+                    val navController = rememberNavController()
+
+                    // Спокойные переходы: короткое растворение и лёгкий сдвиг на 1/12 ширины.
+                    // При «спокойной анимации» — только растворение.
+                    val enter: EnterTransition = if (reduced) {
+                        fadeIn(tween(CalmDurations.QUICK))
+                    } else {
+                        fadeIn(tween(CalmDurations.MEDIUM, easing = CalmEasing.Standard)) +
+                            slideInHorizontally(tween(CalmDurations.LONG, easing = CalmEasing.Enter)) { it / 12 }
+                    }
+                    val exit: ExitTransition = if (reduced) {
+                        fadeOut(tween(CalmDurations.QUICK))
+                    } else {
+                        fadeOut(tween(CalmDurations.SHORT, easing = CalmEasing.Standard)) +
+                            slideOutHorizontally(tween(CalmDurations.MEDIUM, easing = CalmEasing.Exit)) { -it / 16 }
+                    }
+                    val popEnter: EnterTransition = if (reduced) {
+                        fadeIn(tween(CalmDurations.QUICK))
+                    } else {
+                        fadeIn(tween(CalmDurations.MEDIUM, easing = CalmEasing.Standard)) +
+                            slideInHorizontally(tween(CalmDurations.LONG, easing = CalmEasing.Enter)) { -it / 16 }
+                    }
+                    val popExit: ExitTransition = if (reduced) {
+                        fadeOut(tween(CalmDurations.QUICK))
+                    } else {
+                        fadeOut(tween(CalmDurations.SHORT, easing = CalmEasing.Standard)) +
+                            slideOutHorizontally(tween(CalmDurations.MEDIUM, easing = CalmEasing.Exit)) { it / 12 }
+                    }
+
+                    NavHost(
+                        navController = navController,
+                        startDestination = "client",
+                        enterTransition = { enter },
+                        exitTransition = { exit },
+                        popEnterTransition = { popEnter },
+                        popExitTransition = { popExit }
                     ) {
-                        val navController = rememberNavController()
-
-                        // Спокойные переходы: короткое растворение и лёгкий сдвиг на 1/12 ширины.
-                        // При «спокойной анимации» — только растворение.
-                        val enter: EnterTransition = if (reduced) {
-                            fadeIn(tween(CalmDurations.QUICK))
-                        } else {
-                            fadeIn(tween(CalmDurations.MEDIUM, easing = CalmEasing.Standard)) +
-                                slideInHorizontally(tween(CalmDurations.LONG, easing = CalmEasing.Enter)) { it / 12 }
+                        composable("client") {
+                            ClientScreen(
+                                onNavigateSettings = { navController.navigate("settings") },
+                                onNavigateLogs = { navController.navigate("logs") }
+                            )
                         }
-                        val exit: ExitTransition = if (reduced) {
-                            fadeOut(tween(CalmDurations.QUICK))
-                        } else {
-                            fadeOut(tween(CalmDurations.SHORT, easing = CalmEasing.Standard)) +
-                                slideOutHorizontally(tween(CalmDurations.MEDIUM, easing = CalmEasing.Exit)) { -it / 16 }
+                        composable("settings") {
+                            SettingsScreen(onBack = { navController.popBackStack() })
                         }
-                        val popEnter: EnterTransition = if (reduced) {
-                            fadeIn(tween(CalmDurations.QUICK))
-                        } else {
-                            fadeIn(tween(CalmDurations.MEDIUM, easing = CalmEasing.Standard)) +
-                                slideInHorizontally(tween(CalmDurations.LONG, easing = CalmEasing.Enter)) { -it / 16 }
-                        }
-                        val popExit: ExitTransition = if (reduced) {
-                            fadeOut(tween(CalmDurations.QUICK))
-                        } else {
-                            fadeOut(tween(CalmDurations.SHORT, easing = CalmEasing.Standard)) +
-                                slideOutHorizontally(tween(CalmDurations.MEDIUM, easing = CalmEasing.Exit)) { it / 12 }
-                        }
-
-                        NavHost(
-                            navController = navController,
-                            startDestination = "client",
-                            enterTransition = { enter },
-                            exitTransition = { exit },
-                            popEnterTransition = { popEnter },
-                            popExitTransition = { popExit }
-                        ) {
-                            composable("client") {
-                                ClientScreen(
-                                    onNavigateSettings = { navController.navigate("settings") },
-                                    onNavigateLogs = { navController.navigate("logs") }
-                                )
-                            }
-                            composable("settings") {
-                                SettingsScreen(onBack = { navController.popBackStack() })
-                            }
-                            composable("logs") {
-                                LogViewerScreen(
-                                    onBack = { navController.popBackStack() },
-                                    logManager = logManager
-                                )
-                            }
+                        composable("logs") {
+                            LogViewerScreen(
+                                onBack = { navController.popBackStack() },
+                                logManager = logManager
+                            )
                         }
                     }
                 }
             }
+        }
     }
 
     // Видимость интерфейса: в фоне — больший запас буфера вывода (Wi-Fi power-save), без расчёта спектра,
