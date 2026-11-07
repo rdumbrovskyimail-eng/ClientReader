@@ -3,374 +3,237 @@ package com.client.app.ui.components
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.lerp
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.session.LinkState
 import com.client.app.session.SessionState
+import com.client.app.ui.theme.Calm
+import com.client.app.ui.theme.CalmColors
+import com.client.app.ui.theme.CalmDurations
 import kotlinx.coroutines.isActive
-import kotlin.math.cos
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.floor
+import kotlin.math.min
 import kotlin.math.sin
 
-private const val TOTAL_TICKS = 65
+private const val COLS = 25
+private const val ROWS_FULL = 7
+private const val ROWS_COMPACT = 3
 
-// Белый минимализм: чернила, бумага, волосяные линии
-private val ColorSurface = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFEBEBEB)
-private val ColorInk = Color(0xFF0A0A0A)
-private val ColorInkSoft = Color(0xFF262626)
-private val ColorInkMinor = Color(0xFFB8B8BD)
-private val ColorLabel = Color(0xFFA3A3A8)
-
-// Четыре цвета Gemini — акценты интерфейса
-private val GeminiBlue = Color(0xFF4285F4)
-private val GeminiRed = Color(0xFFEA4335)
-private val GeminiYellow = Color(0xFFFBBC04)
-private val GeminiGreen = Color(0xFF34A853)
-private val GeminiPalette = arrayOf(GeminiBlue, GeminiRed, GeminiYellow, GeminiGreen)
-private val GeminiSweep = listOf(GeminiBlue, GeminiRed, GeminiYellow, GeminiGreen, GeminiBlue)
-
-/**
- * Состояние отрисовки без аллокаций в кадре: сглаженные полосы спектра, высоты делений,
- * «присутствие» голоса и время кадра для баллистики, не зависящей от частоты экрана (60/120 Гц).
- */
-private class StripRenderState {
+/** Состояние отрисовки без аллокаций в кадре; баллистика не зависит от частоты экрана. */
+private class HalftoneState {
     val bands = FloatArray(5)
-    val heights = FloatArray(TOTAL_TICKS)
-    var outLevel = 0f
-    var micLevel = 0f
-    var aiPresence = 0f
-    var userPresence = 0f
+    val envelope = FloatArray(COLS)
+    var out = 0f
+    var mic = 0f
+    var ai = 0f
+    var user = 0f
+    var wait = 0f
     var lastFrameNanos = 0L
     var timeSec = 0f
 }
 
 /**
- * FM-шкала голоса: увеличенная по высоте в 2 раза (168.dp) акустическая панель.
- * Во время речи внутри делений загораются микролинии цветов Gemini, бегущие по шкале,
- * с мягким цветным ореолом. Речь модели и речь пользователя различаются направлением бега.
+ * «Полутоновое поле» голоса.
+ *
+ * Сетка точек, как в полиграфическом растре: в тишине — ровная спокойная фактура, когда звучит речь —
+ * точки в центре мягко укрупняются. Цвет подсказывает, кто говорит: шалфей — вы, сумеречно-голубой — Gemini.
+ * Ожидание связи — медленное «дыхание» всей сетки (0,3 Гц), без мигания.
+ *
+ * Чистая визуализация: для TalkBack скрыта (состояние озвучивает заголовок экрана).
+ * При «спокойной анимации» нет бегущей волны, а реакция в 3–4 раза плавнее.
  */
 @Composable
-fun FmStripAudioVisualizer(
+fun VoiceHalftone(
     nativeEngine: NativeAudioEngine,
     state: SessionState,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    compact: Boolean = false
 ) {
-    val render = remember { StripRenderState() }
+    val colors = Calm.colors
+    val reduced = Calm.motion.reduced
+    val render = remember { HalftoneState() }
     val frameNanos = remember { mutableLongStateOf(0L) }
 
     val sessionActive = state.link != LinkState.IDLE
     val isLive = state.link == LinkState.LIVE
-    val isSpeaking = state.isAiSpeaking
-    val isListening = state.isMicActive
-    val hasError = state.error != null
+    val waiting = state.link == LinkState.CONNECTING || state.link == LinkState.RECONNECTING
+    val reconnecting = state.link == LinkState.RECONNECTING
+    val aiSpeaking = state.isAiSpeaking
+    val listening = state.isMicActive && isLive
 
-    LaunchedEffect(sessionActive) {
+    // Кадры идут только во время сессии (и ещё 1,5 с после — чтобы точки спокойно «осели»)
+    LaunchedEffect(sessionActive, reduced) {
         val stopAt = if (sessionActive) Long.MAX_VALUE else System.nanoTime() + 1_500_000_000L
+        val minStep = if (reduced) 33_000_000L else 15_000_000L // ≤ 30 / ≤ 60 кадров в секунду
+        var last = 0L
         while (isActive) {
             val t = withFrameNanos { it }
-            frameNanos.longValue = t
+            if (t - last >= minStep) {
+                frameNanos.longValue = t
+                last = t
+            }
             if (t >= stopAt) break
         }
     }
 
-    val shape = RoundedCornerShape(28.dp)
-
+    val shape = RoundedCornerShape(if (compact) 22.dp else 28.dp)
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .height(168.dp) // Высота увеличена ровно в 2 раза (ранее 84.dp)
-            .shadow(
-                elevation = 6.dp,
-                shape = shape,
-                ambientColor = Color(0x0A000000),
-                spotColor = Color(0x14000000)
-            )
+            .height(if (compact) 64.dp else 116.dp)
             .clip(shape)
-            .background(ColorSurface)
-            .border(1.dp, ColorHairline, shape),
-        contentAlignment = Alignment.Center
+            .background(colors.raised)
+            .border(1.dp, colors.hairline, shape)
+            .clearAndSetSemantics { }
     ) {
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 20.dp, vertical = 26.dp)
+                .padding(horizontal = 18.dp, vertical = if (compact) 10.dp else 16.dp)
         ) {
             val now = frameNanos.longValue
             val dt = if (render.lastFrameNanos == 0L || now <= render.lastFrameNanos) {
-                1f / 120f
+                1f / 60f
             } else {
-                ((now - render.lastFrameNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
+                ((now - render.lastFrameNanos) / 1_000_000_000f).coerceIn(0f, 0.1f)
             }
             render.lastFrameNanos = now
             render.timeSec += dt
 
-            updateBallistics(
+            update(
                 render = render,
                 dt = dt,
                 spectrum = nativeEngine.spectrumUniforms.get(),
                 out = nativeEngine.outLevel.value,
                 mic = nativeEngine.micLevel.value,
-                isSpeaking = isSpeaking,
-                isListening = isListening && isLive
+                aiSpeaking = aiSpeaking,
+                listening = listening,
+                waiting = waiting,
+                reduced = reduced
             )
 
-            drawVoiceStrip(render = render, dt = dt, isLive = isLive)
-            drawNeedle(render = render, isLive = isLive)
-        }
+            val rows = if (compact) ROWS_COMPACT else ROWS_FULL
+            val cellW = size.width / COLS
+            val cellH = size.height / rows
+            val cell = min(cellW, cellH)
+            val rMax = cell * 0.40f
+            val rMin = cell * 0.10f
+            val center = (rows - 1) / 2f
 
-        // Верхний ряд: аналоговая шкала частот тюнера
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 10.dp)
-                .align(Alignment.TopCenter),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            listOf("88", "92", "96", "100", "104", "108").forEachIndexed { index, label ->
-                val edge = index == 0 || index == 5
-                Text(
-                    text = label,
-                    color = if (edge) ColorLabel else ColorLabel.copy(alpha = 0.65f),
-                    fontSize = 8.5.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = if (edge) FontWeight.SemiBold else FontWeight.Medium,
-                    letterSpacing = 0.5.sp
-                )
+            val neutral = colors.ink
+            val voice = voiceColor(colors, render)
+            val waitTint = if (reconnecting) colors.attention else colors.accent
+            val breath = if (reduced) 0.5f else 0.5f + 0.5f * sin(2f * PI.toFloat() * render.timeSec / (CalmDurations.BREATH / 1000f))
+            val idleAlpha = if (colors.isDark) 0.20f else 0.16f
+            val presence = maxOf(render.ai, render.user)
+
+            for (col in 0 until COLS) {
+                val x = cellW * (col + 0.5f)
+                val env = render.envelope[col]
+                for (row in 0 until rows) {
+                    val y = cellH * (row + 0.5f)
+                    val rowDist = if (center == 0f) 0f else abs(row - center) / center
+                    // В компактной полосе всего три ряда: мягче порог, чтобы волна читалась и на одной линии
+                    val raw = if (compact) {
+                        ((env - rowDist * 0.55f) / 0.45f).coerceIn(0f, 1f)
+                    } else {
+                        ((env * 1.15f - rowDist * 0.95f) / 0.30f).coerceIn(0f, 1f)
+                    }
+                    val fill = raw * raw * (3f - 2f * raw)
+
+                    // Фактура покоя / ожидания
+                    var color = neutral.copy(alpha = idleAlpha)
+                    if (render.wait > 0.01f) {
+                        val a = idleAlpha + render.wait * (0.10f + 0.14f * breath)
+                        color = lerp(neutral, waitTint, 0.55f * render.wait).copy(alpha = a)
+                    }
+                    // Голос
+                    if (fill > 0.001f && presence > 0.01f) {
+                        val a = (idleAlpha + (0.92f - idleAlpha) * fill).coerceIn(0f, 1f)
+                        color = lerp(color.copy(alpha = 1f), voice, fill).copy(alpha = a)
+                    }
+                    drawCircle(
+                        color = color,
+                        radius = rMin + (rMax - rMin) * fill,
+                        center = Offset(x, y)
+                    )
+                }
             }
-        }
-
-        // Нижний ряд: статус аудиотракта
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 10.dp)
-                .align(Alignment.BottomCenter),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "FM · ULTRA",
-                color = ColorLabel,
-                fontSize = 8.5.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 1.sp
-            )
-            Text(
-                text = when {
-                    hasError -> "AUDIO FAULT"
-                    isSpeaking -> "GEMINI · SPEAKING"
-                    isLive && isListening -> "LISTENING"
-                    isLive -> "LIVE DUPLEX"
-                    sessionActive -> "CONNECTING"
-                    else -> "READY"
-                },
-                color = when {
-                    hasError -> GeminiRed
-                    isSpeaking -> ColorInk
-                    isLive -> ColorInk
-                    else -> ColorLabel
-                },
-                fontSize = 9.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = if (isSpeaking || isLive) FontWeight.Bold else FontWeight.Medium,
-                letterSpacing = 1.2.sp
-            )
-            Text(
-                text = "WCD9385",
-                color = ColorLabel,
-                fontSize = 8.5.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 1.sp
-            )
         }
     }
 }
 
-/** Экспоненциальная баллистика с постоянными времени: одинаково на 60 и 120 Гц. */
+private fun voiceColor(c: CalmColors, s: HalftoneState): Color {
+    val sum = s.ai + s.user
+    if (sum <= 0.0001f) return c.voiceAi
+    return lerp(c.voiceUser, c.voiceAi, (s.ai / sum).coerceIn(0f, 1f))
+}
+
+/** Экспоненциальное сглаживание с постоянными времени: одинаково на 60 и 120 Гц. */
 private fun follow(current: Float, target: Float, dt: Float, attackSec: Float, releaseSec: Float): Float {
     val tau = if (target > current) attackSec else releaseSec
     val k = 1f - exp(-dt / tau)
     return (current + (target - current) * k).coerceIn(0f, 1f)
 }
 
-private fun updateBallistics(
-    render: StripRenderState,
+private fun update(
+    render: HalftoneState,
     dt: Float,
     spectrum: FloatArray,
     out: Float,
     mic: Float,
-    isSpeaking: Boolean,
-    isListening: Boolean
+    aiSpeaking: Boolean,
+    listening: Boolean,
+    waiting: Boolean,
+    reduced: Boolean
 ) {
+    val slow = if (reduced) 3.5f else 1f
     for (b in 0 until 5) {
-        render.bands[b] = follow(render.bands[b], spectrum.getOrElse(b) { 0f }, dt, 0.030f, 0.160f)
+        render.bands[b] = follow(render.bands[b], spectrum.getOrElse(b) { 0f }, dt, 0.05f * slow, 0.25f * slow)
     }
-    render.outLevel = follow(render.outLevel, out, dt, 0.025f, 0.180f)
-    render.micLevel = follow(render.micLevel, mic, dt, 0.025f, 0.180f)
+    render.out = follow(render.out, out, dt, 0.06f * slow, 0.28f * slow)
+    render.mic = follow(render.mic, mic, dt, 0.06f * slow, 0.28f * slow)
+    render.ai = follow(render.ai, if (aiSpeaking) 1f else 0f, dt, 0.12f * slow, 0.6f * slow)
+    render.user = follow(render.user, if (listening) (render.mic * 4f).coerceAtMost(1f) else 0f, dt, 0.10f * slow, 0.5f * slow)
+    render.wait = follow(render.wait, if (waiting) 1f else 0f, dt, 0.4f, 0.6f)
 
-    val aiTarget = if (isSpeaking) (0.35f + render.outLevel * 3.0f).coerceAtMost(1f) else 0f
-    val userTarget = if (isListening) (render.micLevel * 4.0f).coerceAtMost(1f) else 0f
-    render.aiPresence = follow(render.aiPresence, aiTarget, dt, 0.060f, 0.420f)
-    render.userPresence = follow(render.userPresence, userTarget, dt, 0.050f, 0.320f)
-}
-
-private fun geminiColorAt(p: Float): Color {
-    val x = (p - floor(p)) * 4f
-    val i = x.toInt().coerceIn(0, 3)
-    val f = x - i
-    val s = f * f * (3f - 2f * f)
-    return lerp(GeminiPalette[i], GeminiPalette[(i + 1) % 4], s)
-}
-
-private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive: Boolean) {
-    val w = size.width
-    val h = size.height
-    val cy = h / 2f
-    val spacing = w / (TOTAL_TICKS + 1)
+    val level = maxOf(
+        if (aiSpeaking) (render.out * 1.8f).coerceAtMost(1f) else 0f,
+        if (listening) (render.mic * 2.2f).coerceAtMost(1f) else 0f
+    )
+    val presence = maxOf(render.ai, render.user)
     val t = render.timeSec
-
-    val majorW = 2.4.dp.toPx()
-    val midW = 1.9.dp.toPx()
-    val minorW = 1.5.dp.toPx()
-    val coreMinW = 0.9.dp.toPx()
-
-    val ai = render.aiPresence
-    val user = render.userPresence
-    val presence = maxOf(ai, user)
-    val flow = if (ai >= user) t * 0.22f else -t * 0.22f
-
-    val activity = maxOf(
-        render.outLevel * 1.9f,
-        render.micLevel * 2.2f,
-        if (isLive) 0.05f else 0.02f
-    ).coerceAtMost(1f)
-
-    for (i in 0 until TOTAL_TICKS) {
-        val tick = i + 1
-        val x = tick * spacing
-        val isCenter = tick == TOTAL_TICKS / 2 + 1
-        if (isCenter) continue
-        val isMajor = tick % 5 == 1
-        val isMid = tick % 5 == 3
-
-        val bandEnergy = when {
-            tick <= 14 -> render.bands[0] * 0.85f + render.bands[1] * 0.65f
-            tick <= 34 -> render.bands[2] * 1.15f
-            tick <= 50 -> render.bands[3] * 1.20f
-            else -> render.bands[4] * 1.30f
-        }
-
-        val organic = 0.5f + 0.5f * sin(i * 0.61f + t * 6.2f) * cos(i * 0.23f - t * 2.7f)
-        val level = (activity * (0.55f + 0.45f * organic) + bandEnergy * 0.8f).coerceIn(0f, 1f)
-
-        val base = when {
-            isMajor -> 0.26f
-            isMid -> 0.18f
-            else -> 0.12f
-        }
-        val targetH = base + (0.95f - base) * level
-        val smoothed = follow(render.heights[i], targetH, dt, 0.022f, 0.120f)
-        render.heights[i] = smoothed
-
-        val halfH = (smoothed * (h / 2f)).coerceAtLeast(3.dp.toPx())
-        val barW = when {
-            isMajor -> majorW
-            isMid -> midW
-            else -> minorW
-        }
-        val barColor = when {
-            isMajor -> ColorInk
-            isMid -> ColorInkSoft
-            else -> ColorInkMinor
-        }
-
-        val top = Offset(x, cy - halfH)
-        val bottom = Offset(x, cy + halfH)
-
-        if (presence > 0.01f) {
-            val c = geminiColorAt(i / TOTAL_TICKS.toFloat() * 1.5f + flow)
-            val coreAlpha = (presence * (0.55f + 0.9f * level)).coerceIn(0f, 1f)
-
-            drawLine(
-                color = c.copy(alpha = 0.16f * coreAlpha),
-                start = top,
-                end = bottom,
-                strokeWidth = barW * 3.4f,
-                cap = StrokeCap.Round
-            )
-
-            drawLine(color = barColor, start = top, end = bottom, strokeWidth = barW, cap = StrokeCap.Round)
-
-            val inset = (barW * 1.1f).coerceAtMost(halfH * 0.5f)
-            if (halfH - inset > 1f) {
-                drawLine(
-                    color = c.copy(alpha = coreAlpha),
-                    start = Offset(x, cy - halfH + inset),
-                    end = Offset(x, cy + halfH - inset),
-                    strokeWidth = maxOf(barW * 0.46f, coreMinW),
-                    cap = StrokeCap.Round
-                )
-            }
-        } else {
-            drawLine(color = barColor, start = top, end = bottom, strokeWidth = barW, cap = StrokeCap.Round)
-        }
+    for (col in 0 until COLS) {
+        val x = col / (COLS - 1f)
+        val dist = abs(x - 0.5f) * 2f                    // 0 — центр, 1 — края
+        val bandPos = (dist * 4f).coerceIn(0f, 4f)
+        val i = floor(bandPos).toInt().coerceIn(0, 4)
+        val j = (i + 1).coerceAtMost(4)
+        val f = bandPos - i
+        val energy = render.bands[i] * (1f - f) + render.bands[j] * f
+        val wave = if (reduced) 0.5f else 0.5f + 0.5f * sin(col * 0.42f - t * 1.1f)
+        val target = (presence * (0.16f + 0.55f * level * (0.65f + 0.35f * wave) + 0.45f * energy - 0.22f * dist))
+            .coerceIn(0f, 1f)
+        render.envelope[col] = follow(render.envelope[col], target, dt, 0.09f * slow, 0.45f * slow)
     }
-}
-
-private fun DrawScope.drawNeedle(render: StripRenderState, isLive: Boolean) {
-    val cx = size.width / 2f
-    val h = size.height
-    val needleW = 1.75.dp.toPx()
-
-    drawLine(
-        color = ColorInk,
-        start = Offset(cx, 1.5.dp.toPx()),
-        end = Offset(cx, h - 1.5.dp.toPx()),
-        strokeWidth = needleW,
-        cap = StrokeCap.Round
-    )
-
-    val beadRadius = 4.dp.toPx()
-    val beadCenter = Offset(cx, beadRadius + 1.dp.toPx())
-    if (isLive) {
-        rotate(degrees = (render.timeSec * 90f) % 360f, pivot = beadCenter) {
-            drawCircle(
-                brush = Brush.sweepGradient(GeminiSweep, center = beadCenter),
-                radius = beadRadius,
-                center = beadCenter
-            )
-        }
-        drawCircle(color = ColorSurface, radius = beadRadius * 0.38f, center = beadCenter)
-    } else {
-        drawCircle(color = ColorInk, radius = beadRadius, center = beadCenter)
-    }
-
-    drawCircle(
-        color = ColorInk,
-        radius = 2.2.dp.toPx(),
-        center = Offset(cx, h - 2.2.dp.toPx() - 1.dp.toPx())
-    )
 }
