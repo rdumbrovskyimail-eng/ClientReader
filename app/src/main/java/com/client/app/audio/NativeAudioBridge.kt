@@ -93,7 +93,19 @@ class NativeAudioBridge @Inject constructor() {
 
     // Мягкая пауза вывода без потери данных (перебивание с подтверждением)
     external fun setPlaybackPaused(paused: Boolean)
+    // true при «приглушении» или жёсткой паузе
     external fun isPlaybackPaused(): Boolean
+
+    // Жёсткая пауза: очередь не читается, продолжение — с того же сэмпла (читалка, аудиофокус)
+    external fun setPlaybackHardPaused(paused: Boolean)
+    external fun isPlaybackHardPaused(): Boolean
+
+    // Профиль буферизации вывода: предзаполнение и границы DSP-очереди, мс
+    external fun setPlaybackBufferProfile(primeMs: Int, minTargetMs: Int, maxTargetMs: Int)
+    external fun getEffectivePlaybackPrimeMs(): Int
+
+    // FFT для визуализатора: выключается, когда интерфейс скрыт
+    external fun setSpectrumEnabled(enabled: Boolean)
 
     // Тонкомпенсация: 0 = динамик, 1 = гарнитура HFP, 2 = наушники (A2DP/проводные/USB/LE)
     external fun setOutputEqProfile(profile: Int)
