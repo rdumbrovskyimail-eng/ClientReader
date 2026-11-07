@@ -28,8 +28,11 @@ jobs:
           set -euo pipefail
           MODEL_PATH="app/src/main/assets/models/silero_vad_v5_quant.onnx"
           test -f "$MODEL_PATH" || { echo "Missing Silero V5 model in repository"; exit 1; }
-          git lfs pull --include="$MODEL_PATH"
-          git lfs checkout -- "$MODEL_PATH"
+# LFS — только если файл действительно отслеживается LFS (после переноса в обычный git — пропуск)
+          if git check-attr filter -- "$MODEL_PATH" | grep -q "filter: lfs"; then
+            git lfs pull --include="$MODEL_PATH"
+            git lfs checkout -- "$MODEL_PATH"
+          fi
           test -s "$MODEL_PATH"
           SIZE_BYTES="$(stat -c%s "$MODEL_PATH")"
           test "$SIZE_BYTES" -ge 500000 || { echo "Silero V5 model is too small: $SIZE_BYTES"; exit 1; }
@@ -38,6 +41,8 @@ jobs:
           fi
           echo "Silero V5 model SHA-256 (must be reviewed against the pinned repository artifact):"
           sha256sum "$MODEL_PATH"
+          # Закреплённая модель: silero_vad.onnx из официального пакета silero-vad 6.2.0 (MIT)
+          echo "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3  $MODEL_PATH" | sha256sum -c -
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
