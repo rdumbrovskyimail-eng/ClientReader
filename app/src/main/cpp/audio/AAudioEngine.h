@@ -26,9 +26,6 @@ constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
 constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
 constexpr size_t FFT_TAP_BUFFER_CAPACITY = 4096;
 
-/**
- * Строгий конечный автомат жизненного цикла движка.
- */
 enum class EngineState : int32_t {
     IDLE = 0,
     STARTING = 1,
@@ -37,9 +34,6 @@ enum class EngineState : int32_t {
     STOPPING = 4
 };
 
-/**
- * Таксономия аппаратных сбоев AAudio.
- */
 enum class StreamFaultType : int32_t {
     NONE = 0,
     SOFT_TIMEOUT = 1,
@@ -48,19 +42,13 @@ enum class StreamFaultType : int32_t {
     SYSTEM_ERROR = 4
 };
 
-/**
- * Структурированное событие аппаратного сбоя.
- */
 struct StreamErrorEvent {
     int32_t direction{0}; // 1 = Input (Capture), 2 = Output (Playback)
-    int32_t errorCode{0}; // Код AAUDIO_ERROR_*
+    int32_t errorCode{0};
     StreamFaultType faultType{StreamFaultType::NONE};
     uint64_t timestampNs{0};
 };
 
-/**
- * Разделение физических возможностей оборудования и активной конфигурации.
- */
 struct HardwareAudioCapabilities {
     bool supports16k{false};
     bool supports24k{false};
@@ -82,9 +70,6 @@ struct HardwareAudioActiveConfig {
     bool isExclusive{false};
 };
 
-/**
- * Сквозная телеметрия баланса фреймов и качества тракта (E2E Accounting).
- */
 struct AudioPipelineDiagnostics {
     uint64_t totalHardwareCapturedFrames{0};
     uint64_t totalDspProcessedFrames{0};
@@ -99,11 +84,6 @@ struct AudioPipelineDiagnostics {
     int32_t lastXRunCount{0};
 };
 
-/**
- * Фильтр подавления инфразвука и постоянной составляющей (DC / Subsonic Filter, 35 Гц).
- * Устраняет постоянный ток и микро-колебания ниже диапазона динамика смартфона,
- * предотвращая чрезмерный ход диффузора (Excursion) и срабатывание защиты SmartPA.
- */
 struct SubsonicHighPass {
     double b0{1.0}, b1{-2.0}, b2{1.0};
     double a1{0.0}, a2{0.0};
@@ -112,11 +92,11 @@ struct SubsonicHighPass {
     void reset(double fs = 48000.0) {
         s1 = 0.0;
         s2 = 0.0;
-        const double fc = 35.0; // Срез инфразвука ниже 35 Гц (динамик телефона не воспроизводит)
+        const double fc = 35.0;
         const double omega = 2.0 * 3.141592653589793 * fc / fs;
         const double c = std::cos(omega);
         const double s = std::sin(omega);
-        const double alpha = s / (2.0 * 0.7071067811865475); // Butterworth Q = 0.707
+        const double alpha = s / (2.0 * 0.7071067811865475);
         const double a0 = 1.0 + alpha;
 
         b0 = ((1.0 + c) / 2.0) / a0;
@@ -137,10 +117,6 @@ struct SubsonicHighPass {
     }
 };
 
-/**
- * Цифровой биквадрат в транспонированной прямой форме II (TDF-II).
- * Гарантирует устойчивость фильтра и вычисления с двойной точностью.
- */
 struct BiquadTdf2 {
     double b0{1.0};
     double b1{0.0};
@@ -169,11 +145,6 @@ struct BiquadTdf2 {
     void makeIdentity();
 };
 
-/**
- * Пиковый лимитер с предпросмотром ~1.5 мс: усиление снижается ДО прихода пика,
- * поэтому нет жёсткого срезания вершин и нечётных гармоник (прежний лимитер без задержки
- * пропускал атаку и досрезал её клиппером). Потолок −1 dBFS.
- */
 class LookaheadPeakLimiter {
 public:
     static constexpr size_t MAX_LOOKAHEAD = 256;
@@ -208,17 +179,9 @@ private:
     double gain_{1.0};
     double attackCoeff_{0.0};
     double releaseCoeff_{0.0};
-    double ceiling_{0.891}; // −1 dBFS
+    double ceiling_{0.891};
 };
 
-/**
- * Тонкомпенсация голоса под маршрут вывода («тёплый» тембр без гула и перегрузки):
- * - SPEAKER: ФВЧ 120 Гц (не тратим ход диффузора на недоступный бас), +1.5 дБ полка 320 Гц (тело голоса),
- *   −1.0 дБ полка 7 кГц (мягче сибилянты на малом динамике);
- * - HEADSET_VOICE (HFP): ФВЧ 70 Гц, +2.0 дБ полка 200 Гц, +1.2 дБ пик 2.8 кГц (разборчивость через mSBC);
- * - HEADPHONES: ФВЧ 25 Гц, +2.5 дБ полка 160 Гц (теплота), +1.0 дБ полка 9 кГц (воздух).
- * Предусиление компенсирует подъёмы, лимитер с предпросмотром страхует пики.
- */
 class AnalogVoiceEnhancer {
 public:
     AnalogVoiceEnhancer();
@@ -252,21 +215,17 @@ public:
 
     bool startPlayback();
 
-    // Трёхфазный барьер безопасного старта микрофона
     bool startCapture();
     bool activateCaptureDsp();
     bool commitCaptureAdmission();
     void stopCapture();
 
-    // Изолированный целевой перезапуск конкретных стримов
     bool restartCaptureStream();
     bool restartPlaybackStream();
 
-    // Неблокирующий Try-Write контракт
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    // Аппаратный Soft-Flush без остановки потока ЦАП
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -274,34 +233,24 @@ public:
     void setVolume(float vol);
     void setMicGain(float gain);
 
-    // Мягкая пауза вывода без потери данных (перебивание): позиция очереди удерживается
     void setPlaybackPaused(bool paused);
-    // true при «приглушении» ИЛИ жёсткой паузе: сторожа зависания записи не считают паузу сбоем
     bool isPlaybackPaused() const {
         return playbackPaused_.load(std::memory_order_acquire) ||
                playbackHardPaused_.load(std::memory_order_acquire);
     }
 
-    // Жёсткая пауза (читалка, временная потеря аудиофокуса): очередь не читается,
-    // продолжение начинается ровно с того же сэмпла. Управляется только из Kotlin.
     void setPlaybackHardPaused(bool paused);
     bool isPlaybackHardPaused() const { return playbackHardPaused_.load(std::memory_order_acquire); }
 
-    // Профиль буферизации вывода: предзаполнение перед стартом фразы и границы цели DSP-очереди (мс)
     void setPlaybackBufferProfile(int32_t primeMs, int32_t minTargetMs, int32_t maxTargetMs);
     int32_t getEffectivePlaybackPrimeMs();
 
-    // Спектр для UI: при скрытом интерфейсе FFT не считается (экономия CPU в фоне)
     void setSpectrumEnabled(bool enabled) { spectrumEnabled_.store(enabled, std::memory_order_relaxed); }
 
-    // Тонкомпенсация под маршрут: OUTPUT_EQ_SPEAKER / OUTPUT_EQ_HEADSET_VOICE / OUTPUT_EQ_HEADPHONES
     void setOutputEqProfile(int32_t profile);
-
-    // Hi-Fi Bluetooth: вывод как медиа (A2DP, стерео 48 кГц) вместо голосового канала связи (HFP/SCO)
     void setMediaPlaybackUsage(bool enabled) { mediaPlaybackUsage_.store(enabled, std::memory_order_release); }
 
-    // Блокирующее ожидание целого кадра захвата (вместо опроса с задержкой 2 мс)
-    bool waitForCaptureFrames(size_frames, int32_t timeoutMs);
+    bool waitForCaptureFrames(size_t frames, int32_t timeoutMs);
     int32_t getCaptureSessionId() const { return captureSessionId_.load(std::memory_order_relaxed); }
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
@@ -326,7 +275,6 @@ public:
         return errorEventPending_.load(std::memory_order_acquire);
     }
 
-    // Метрология аппаратных таймстемпов и последовательности
     uint64_t getCaptureSequenceNumber() const {
         return captureSequenceNumber_.load(std::memory_order_relaxed);
     }
@@ -365,14 +313,12 @@ public:
         return actualOutputDeviceId_.load(std::memory_order_relaxed);
     }
 
-    // Раздельные очереди и физическая задержка в миллисекундах
     size_t getPendingPlaybackInputFrames() const;
     size_t getPendingPlaybackOutputFrames() const;
     size_t getPendingPlaybackFrames() const;
     float getPendingPlaybackDurationMs() const;
     float getTotalEstimatedPlaybackLatencyMs() const;
 
-    // Метрики потерь и качества звукового тракта
     uint64_t getCaptureDroppedFrames() const {
         return captureDroppedFrames_.load(std::memory_order_relaxed);
     }
@@ -471,26 +417,19 @@ private:
     std::atomic<bool> isExclusiveSharingActive_{false};
     std::atomic<bool> isDisconnectedExplicit_{false};
 
-    // Очередь аппаратных сбоев
     std::mutex errorQueueMutex_;
     std::queue<StreamErrorEvent> errorEventQueue_;
     std::atomic<bool> errorEventPending_{false};
 
-    // Метрология аппаратных счетчиков последовательности и таймстемпов
     alignas(64) std::atomic<uint64_t> captureSequenceNumber_{0};
     alignas(64) std::atomic<uint64_t> lastCaptureTimestampNs_{0};
     alignas(64) std::atomic<uint64_t> playbackSequenceNumber_{0};
     alignas(64) std::atomic<uint64_t> lastPlaybackPresentationTimestampNs_{0};
-    // Публикуются ТОЛЬКО колбэком воспроизведения: AAudioStream_getTimestamp() нельзя вызывать
-    // конкурентно из других потоков, а сам поток может быть закрыт stop() под lifecycleMutex_
     std::atomic<int64_t> lastHwFramePosition_{0};
     std::atomic<int64_t> lastHwFramesWritten_{0};
-    // Сериализует JNI-продюсеров (Gemini, Forvo) и flush. В RT-колбэке AAudio НЕ используется.
     std::mutex playbackProducerMutex_;
-    // tail входной очереди на момент последнего flush: DSP-поток отбрасывает только данные ДО него
     std::atomic<size_t> playbackFlushInputMark_{0};
 
-    // Адаптивный джиттер-буфер (AJB) и контроллер скорости вывода (TSM)
     alignas(64) std::atomic<size_t> playbackTargetBufferMs_{PLAYBACK_TARGET_BUFFER_MS};
     alignas(64) std::atomic<uint64_t> lastPlaybackWriteNs_{0};
     alignas(64) std::atomic<int64_t> interArrivalJitterNs_{0};
@@ -520,7 +459,6 @@ private:
     alignas(64) std::atomic<float> micNoiseFloorRms_{0.015f};
     std::atomic<bool> isPlaybackRenderingActive_{false};
 
-    // Сквозные счетчики потерь данных
     alignas(64) std::atomic<uint64_t> totalHardwareCapturedFrames_{0};
     alignas(64) std::atomic<uint64_t> totalDspProcessedFrames_{0};
     alignas(64) std::atomic<uint64_t> captureDroppedFrames_{0};
@@ -534,7 +472,6 @@ private:
     alignas(64) std::atomic<uint32_t> captureErrorCount_{0};
     alignas(64) std::atomic<uint32_t> playbackErrorCount_{0};
     alignas(64) std::atomic<int32_t> lastXRunCount_{0};
-
     alignas(64) std::atomic<int32_t> lastTunedXRunCount_{0};
 
     alignas(64) std::array<std::atomic<uint32_t>, ERROR_HISTOGRAM_BUCKETS> errorHistogram_{};
@@ -556,7 +493,6 @@ private:
 
     std::atomic<bool> micPipelineAdmitted_{false};
 
-    // Пауза/предзаполнение/тонкомпенсация вывода
     std::atomic<bool> playbackPaused_{false};
     std::atomic<bool> playbackHardPaused_{false};
     std::atomic<int32_t> playbackPrimeBaseMs_{PLAYBACK_PRIME_MS};
@@ -569,9 +505,34 @@ private:
     std::atomic<int32_t> outputEqProfile_{OUTPUT_EQ_SPEAKER};
     std::atomic<bool> outputEqDirty_{true};
     std::atomic<bool> mediaPlaybackUsage_{false};
-    // Состояние RT-колбэка воспроизведения (изменяется только потоком колбэка)
+
     float playbackRampGain_{0.0f};
     bool playbackPriming_{true};
 
-    // Захват: сессия эффектов (AEC/NS) и сигнал готовности кадра
-    std::atomic<
+    std::atomic<int32_t> captureSessionId_{0};
+    std::mutex captureReadyMutex_;
+    std::condition_variable captureReadyCv_;
+
+    PolyphaseResampler24To16 resampler24To16_;
+    PolyphaseResampler24To32 resampler24To32_;
+    HalfbandResampler24To48 halfbandResampler24To48_;
+    StreamingLinearResampler genericResampler_;
+    UnifiedCaptureResampler unifiedCaptureResampler_;
+    AnalogVoiceEnhancer voiceEnhancer_;
+
+    std::unique_ptr<dsp::FastFft> fftProcessor_;
+
+    std::vector<int16_t> playbackDspInputScratch_;
+    std::vector<int16_t> playbackDspOutputScratch_;
+    std::vector<int16_t> earconScratch_;
+    std::vector<int16_t> captureRawScratchBuffer_;
+    std::vector<int16_t> captureDecimateBuffer_;
+    std::vector<int16_t> captureInputScratchBuffer_;
+
+    std::atomic<uint64_t> playbackEpoch_{1};
+    std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
+    std::atomic<bool> earconRequested_{false};
+    std::mutex playbackControlMutex_;
+};
+
+} // namespace client::audio
