@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -182,7 +183,8 @@ fun PromptPill(
 }
 
 /**
- * Редактор системной роли поверх экрана.
+ * Редактор поверх экрана: две вкладки — «Чтение вслух» (текст для диктора, любой объём) и «Роль»
+ * (системная роль ассистента). Текст для чтения НЕ становится системным промптом.
  *
  * Шторка занимает всё место между строкой состояния и клавиатурой (insets statusBars + ime/navigationBars),
  * но не выше 640 dp. Когда открывается клавиатура, сжимается только поле ввода (оно прокручивается),
@@ -193,7 +195,10 @@ fun PromptEditorSheet(
     visible: Boolean,
     currentPrompt: String,
     onApply: (String) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    readText: String = "",
+    onReadTextChange: (String) -> Unit = {},
+    onRead: ((String) -> Unit)? = null
 ) {
     val context = LocalContext.current
 
@@ -210,9 +215,16 @@ fun PromptEditorSheet(
         val clipboardManager = LocalClipboardManager.current
         val focusManager = LocalFocusManager.current
         var draft by remember { mutableStateOf(currentPrompt) }
+        // Основной сценарий — чтение вслух: шторка открывается на вкладке текста для диктора
+        var readMode by remember { mutableStateOf(onRead != null) }
         val sheetState = remember { MutableTransitionState(false) }.apply { targetState = true }
         val fieldInteraction = remember { MutableInteractionSource() }
         val fieldFocused by fieldInteraction.collectIsFocusedAsState()
+
+        val text = if (readMode) readText else draft
+        fun setText(value: String) {
+            if (readMode) onReadTextChange(value) else draft = value
+        }
 
         fun close() {
             focusManager.clearFocus(force = true)
@@ -268,7 +280,7 @@ fun PromptEditorSheet(
                                 )
                                 Spacer(Modifier.width(8.dp))
                                 Text(
-                                    text = "SYSTEM PROMPT",
+                                    text = if (readMode) "ЧТЕНИЕ ВСЛУХ" else "SYSTEM PROMPT",
                                     color = ColorTextMuted,
                                     fontSize = 10.sp,
                                     fontFamily = FontFamily.Monospace,
@@ -278,14 +290,18 @@ fun PromptEditorSheet(
                             }
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                text = "Роль и правила ассистента",
+                                text = if (readMode) "Текст для диктора" else "Роль и правила ассистента",
                                 color = ColorTextPrimary,
                                 fontSize = 18.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
                             Spacer(Modifier.height(3.dp))
                             Text(
-                                text = "Применяется сразу: активная сессия переподключится с новой ролью.",
+                                text = if (readMode) {
+                                    "Любой объём: диктор прочитает всё. Пауза и продолжение — голосом, кнопкой или гарнитурой."
+                                } else {
+                                    "Применяется сразу: активная сессия переподключится с новой ролью."
+                                },
                                 color = ColorTextSecondary,
                                 fontSize = 12.sp,
                                 lineHeight = 16.sp
@@ -302,6 +318,20 @@ fun PromptEditorSheet(
                         }
                     }
 
+                    if (onRead != null) {
+                        Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ModeChip("Чтение вслух", selected = readMode) {
+                                performTactileClick(context)
+                                readMode = true
+                            }
+                            ModeChip("Роль ассистента", selected = !readMode) {
+                                performTactileClick(context)
+                                readMode = false
+                            }
+                        }
+                    }
+
                     Spacer(Modifier.height(14.dp))
 
                     // Поле ввода: забирает всё оставшееся место и прокручивается внутри себя
@@ -315,8 +345,8 @@ fun PromptEditorSheet(
                             .padding(horizontal = 16.dp, vertical = 14.dp)
                     ) {
                         BasicTextField(
-                            value = draft,
-                            onValueChange = { draft = it },
+                            value = text,
+                            onValueChange = { setText(it) },
                             modifier = Modifier.fillMaxSize(),
                             textStyle = TextStyle(
                                 color = ColorTextPrimary,
@@ -328,9 +358,13 @@ fun PromptEditorSheet(
                             cursorBrush = SolidColor(ColorTextPrimary),
                             decorationBox = { innerTextField ->
                                 Box(modifier = Modifier.fillMaxSize()) {
-                                    if (draft.isEmpty()) {
+                                    if (text.isEmpty()) {
                                         Text(
-                                            text = "Например: «Ты — терпеливый преподаватель немецкого. Отвечай коротко и по делу.»",
+                                            text = if (readMode) {
+                                                "Вставьте сюда текст — кнопка «Вставить» внизу. Абзацы, диалоги, списки и числа диктор прочитает с правильной интонацией."
+                                            } else {
+                                                "Например: «Ты — терпеливый преподаватель немецкого. Отвечай коротко и по делу.»"
+                                            },
                                             color = ColorTextMuted,
                                             fontSize = 15.sp,
                                             lineHeight = 22.sp
@@ -344,7 +378,12 @@ fun PromptEditorSheet(
 
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text = "${draft.length} симв.",
+                        text = if (readMode && text.isNotBlank()) {
+                            // ≈ 14,5 символа в секунду — средний темп диктора
+                            "${text.length} симв. · ≈ ${(text.length / 14.5f / 60f).toInt().coerceAtLeast(1)} мин чтения"
+                        } else {
+                            "${text.length} симв."
+                        },
                         color = ColorTextMuted,
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
@@ -360,8 +399,8 @@ fun PromptEditorSheet(
                     ) {
                         SheetIconButton(icon = Icons.Filled.ContentCopy, description = "Копировать") {
                             performTactileClick(context)
-                            if (draft.isNotBlank()) {
-                                clipboardManager.setText(AnnotatedString(draft))
+                            if (text.isNotBlank()) {
+                                clipboardManager.setText(AnnotatedString(text))
                                 Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -369,12 +408,12 @@ fun PromptEditorSheet(
                             performTactileClick(context)
                             val pasted = clipboardManager.getText()?.text.orEmpty()
                             if (pasted.isNotBlank()) {
-                                draft = if (draft.isBlank()) pasted else "$draft\n$pasted"
+                                setText(if (text.isBlank()) pasted else "$text\n$pasted")
                             }
                         }
                         SheetIconButton(icon = Icons.Filled.DeleteOutline, description = "Очистить") {
                             performTactileClick(context)
-                            draft = ""
+                            setText("")
                         }
 
                         Row(
@@ -385,6 +424,17 @@ fun PromptEditorSheet(
                                 .background(ColorApply)
                                 .clickable {
                                     performTactileClick(context)
+                                    if (readMode && onRead != null) {
+                                        val clean = readText.trim()
+                                        if (clean.isEmpty()) {
+                                            Toast.makeText(context, "Вставьте текст для чтения", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            onRead(clean)
+                                            close()
+                                            Toast.makeText(context, "Читаю…", Toast.LENGTH_SHORT).show()
+                                        }
+                                        return@clickable
+                                    }
                                     val clean = draft.trim()
                                     val changed = clean != currentPrompt.trim()
                                     if (changed) onApply(clean)
@@ -399,14 +449,14 @@ fun PromptEditorSheet(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.Check,
+                                imageVector = if (readMode) Icons.Filled.PlayArrow else Icons.Filled.Check,
                                 contentDescription = null,
                                 tint = ColorOnApply,
                                 modifier = Modifier.size(17.dp)
                             )
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                text = "Готово",
+                                text = if (readMode) "Читать" else "Готово",
                                 color = ColorOnApply,
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold,
@@ -417,6 +467,29 @@ fun PromptEditorSheet(
                 }
             }
         }
+    }
+}
+
+/**
+ * Переключатель вкладок шторки («Чтение вслух» / «Роль ассистента»).
+ */
+@Composable
+private fun ModeChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(
+        modifier = Modifier
+            .clip(shape)
+            .background(if (selected) ColorApply else ColorButton)
+            .border(1.dp, if (selected) ColorApply else ColorHairline, shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    ) {
+        Text(
+            text = label,
+            color = if (selected) ColorOnApply else ColorTextSecondary,
+            fontSize = 12.5.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+        )
     }
 }
 
