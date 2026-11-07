@@ -631,15 +631,6 @@ fun SettingsScreen(
                         valueRange = 0f..300f,
                         colors = whiteSliderColors()
                     )
-
-                    Text("Пауза конца фразы: ${silenceDurationDraft} мс", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
-                    Slider(
-                        value = silenceDurationDraft.toFloat(),
-                        onValueChange = { silenceDurationDraft = it.toInt() },
-                        onValueChangeFinished = { viewModel.setSilenceDurationMs(silenceDurationDraft) },
-                        valueRange = 200f..1500f,
-                        colors = whiteSliderColors()
-                    )
                 }
 
                 // Действует и в ручном режиме (по умолчанию): это «хвост» локального VAD перед activityEnd
