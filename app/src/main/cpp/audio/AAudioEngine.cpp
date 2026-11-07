@@ -6,6 +6,10 @@
 #include <android/log.h>
 #include <pthread.h>
 
+#include <sys/resource.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <algorithm>
 #include <cmath>
@@ -36,6 +40,15 @@
 
 namespace client::audio {
 
+// DSP-потоки создаются std::thread с обычным приоритетом. В фоне и при выключенном экране процесс
+// переходит в урезанный cpuset, и такой поток может «голодать» дольше окна вывода — отсюда провалы
+// звука при свёрнутом приложении. ANDROID_PRIORITY_AUDIO (−16) приложению разрешён.
+static void raiseDspThreadPriority(const char* name) {
+    if (setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), NATIVE_DSP_THREAD_NICE) != 0) {
+        LOGW("%s: setpriority(%d) failed, errno=%d", name, NATIVE_DSP_THREAD_NICE, errno);
+    }
+}
+
 void BiquadTdf2::reset() {
     s1 = 0.0;
     s2 = 0.0;
@@ -54,7 +67,7 @@ void BiquadTdf2::makeLowShelf(double fc, double gainDb, double fs, double S) {
     b1 = (2.0 * A * ((A - 1.0) - (A + 1.0) * cs)) / a0;
     b2 = (A * ((A + 1.0) - (A - 1.0) * cs - beta)) / a0;
     a1 = (-2.0 * ((A - 1.0) + (A + 1.0) * cs)) / a0;
-    a2 = ((A + 1.0) + (A - 1.0) * cs - beta) / a0;
+    a2 = ((A + 1.0) - (A - 1.0) * cs - beta) / a0;
 }
 
 void BiquadTdf2::makeHighShelf(double fc, double gainDb, double fs, double S) {
@@ -1051,6 +1064,7 @@ float AAudioEngine::getTotalEstimatedPlaybackLatencyMs() const {
 
 void AAudioEngine::captureDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioCapWorker");
+    raiseDspThreadPriority("AudioCapWorker");
     dsp::FtzGuard ftzGuard;
 
     try {
@@ -1184,6 +1198,7 @@ void AAudioEngine::fftTapThreadLoop() {
 
 void AAudioEngine::playbackDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioDspWorker");
+    raiseDspThreadPriority("AudioDspWorker");
     dsp::FtzGuard ftzGuard;
 
     try {
@@ -1338,7 +1353,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 const size_t written = playbackBuffer_.writeAllOrNothing(output, outputFrames);
                 if (written == 0) {
                     playbackDroppedFrames_.fetch_add(outputFrames, std::memory_order_relaxed);
-                } else {
+                } else if (spectrumEnabled_.load(std::memory_order_relaxed)) {
                     fftTapBuffer_.write(output, outputFrames);
                     fftTapCv_.notify_one();
                 }
@@ -1384,10 +1399,11 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_
         jitter += (diffNs - jitter) / 16;
         interArrivalJitterNs_.store(jitter, std::memory_order_relaxed);
 
+        // Границы задаёт профиль буферизации (разговор / фон / читалка)
         const size_t dynamicTargetMs = static_cast<size_t>(
             std::clamp<int64_t>((jitter / 1000000LL) * 2 + 35,
-                                static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS),
-                                static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_BT_MAX_MS))
+                                static_cast<int64_t>(playbackTargetMinMs_.load(std::memory_order_relaxed)),
+                                static_cast<int64_t>(playbackTargetMaxMs_.load(std::memory_order_relaxed)))
         );
         playbackTargetBufferMs_.store(dynamicTargetMs, std::memory_order_relaxed);
     }
@@ -1428,7 +1444,10 @@ void AAudioEngine::flushPlayback(uint64_t generation) {
     outRms_.store(0.0f, std::memory_order_relaxed);
     lastPlaybackWriteNs_.store(0, std::memory_order_relaxed);
     interArrivalJitterNs_.store(0, std::memory_order_relaxed);
-    playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
+    playbackTargetBufferMs_.store(static_cast<size_t>(std::clamp<int64_t>(
+        static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_MS),
+        static_cast<int64_t>(playbackTargetMinMs_.load(std::memory_order_relaxed)),
+        static_cast<int64_t>(playbackTargetMaxMs_.load(std::memory_order_relaxed)))), std::memory_order_relaxed);
 
     playbackDspInputBuffer_.discardAllQuiesced();
     playbackBuffer_.discardAllQuiesced();
@@ -1458,6 +1477,41 @@ void AAudioEngine::setMicGain(float gain) {
 void AAudioEngine::setPlaybackPaused(bool paused) {
     playbackPaused_.store(paused, std::memory_order_release);
     playbackDspCv_.notify_all();
+}
+
+void AAudioEngine::setPlaybackHardPaused(bool paused) {
+    playbackHardPaused_.store(paused, std::memory_order_release);
+    playbackDspCv_.notify_all();
+}
+
+void AAudioEngine::setPlaybackBufferProfile(int32_t primeMs, int32_t minTargetMs, int32_t maxTargetMs) {
+    const int32_t prime = std::clamp(primeMs, PLAYBACK_PRIME_MS, PLAYBACK_PRIME_MAX_MS);
+    const int32_t minTarget = std::clamp(minTargetMs, 20, 600);
+    const int32_t maxTarget = std::clamp(maxTargetMs, minTarget, 800);
+    playbackPrimeBaseMs_.store(prime, std::memory_order_relaxed);
+    playbackTargetMinMs_.store(minTarget, std::memory_order_relaxed);
+    playbackTargetMaxMs_.store(maxTarget, std::memory_order_relaxed);
+    const size_t current = playbackTargetBufferMs_.load(std::memory_order_relaxed);
+    playbackTargetBufferMs_.store(static_cast<size_t>(std::clamp<int64_t>(
+        static_cast<int64_t>(current), minTarget, maxTarget)), std::memory_order_relaxed);
+    playbackDspCv_.notify_all();
+    LOGI("Playback buffer profile: prime=%d ms, DSP target=%d..%d ms", prime, minTarget, maxTarget);
+}
+
+int32_t AAudioEngine::getEffectivePlaybackPrimeMs() {
+    int32_t boost = playbackRebufferBoostMs_.load(std::memory_order_relaxed);
+    if (boost > 0) {
+        timespec ts{};
+        clock_gettime(CLOCK_BOOTTIME, &ts);
+        const int64_t nowNs = static_cast<int64_t>(ts.tv_sec) * 1000000000LL + static_cast<int64_t>(ts.tv_nsec);
+        const int64_t last = lastRebufferNs_.load(std::memory_order_relaxed);
+        if (last > 0 && nowNs - last > PLAYBACK_REBUFFER_DECAY_NS) {
+            playbackRebufferBoostMs_.store(0, std::memory_order_relaxed);
+            boost = 0;
+        }
+    }
+    return std::clamp(playbackPrimeBaseMs_.load(std::memory_order_relaxed) + boost,
+                      PLAYBACK_PRIME_MS, PLAYBACK_PRIME_MAX_MS);
 }
 
 void AAudioEngine::setOutputEqProfile(int32_t profile) {
@@ -1586,6 +1640,30 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     const size_t fadeFrames = std::max<size_t>(1, static_cast<size_t>(rate) * PLAYBACK_FADE_MS / 1000);
     const float rampStep = 1.0f / static_cast<float>(fadeFrames);
 
+    // 1) Жёсткая пауза: очередь не читается — продолжение начнётся с того же сэмпла.
+    //    Перед тишиной — короткое затухание (≈12 мс), чтобы не было щелчка.
+    if (engine->playbackHardPaused_.load(std::memory_order_acquire)) {
+        size_t produced = 0;
+        if (!engine->playbackPriming_ && engine->playbackRampGain_ > 0.0f) {
+            const size_t pauseFade = std::min(frames, std::max<size_t>(
+                1, static_cast<size_t>(rate) * PLAYBACK_HARD_PAUSE_FADE_MS / 1000));
+            produced = engine->playbackBuffer_.read(samples, pauseFade);
+            float g = engine->playbackRampGain_;
+            const float step = g / static_cast<float>(std::max<size_t>(1, produced));
+            for (size_t i = 0; i < produced; ++i) {
+                g = std::max(0.0f, g - step);
+                samples[i] = static_cast<int16_t>(std::lrintf(static_cast<float>(samples[i]) * g));
+            }
+        }
+        if (produced < frames) {
+            std::memset(samples + produced, 0, (frames - produced) * sizeof(int16_t));
+        }
+        engine->playbackRampGain_ = 0.0f;
+        engine->playbackPriming_ = true;   // после снятия паузы — мягкий вход с полного буфера
+        engine->outRms_.store(0.0f, std::memory_order_relaxed);
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+
     if (engine->playbackPrimeRequested_.exchange(false, std::memory_order_acq_rel)) {
         engine->playbackPriming_ = true;
         engine->playbackRampGain_ = 0.0f;
@@ -1600,16 +1678,23 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     // 2) Предзаполнение перед стартом фразы: убирает заикание первого слога при сетевом джиттере
     if (engine->playbackPriming_) {
         const size_t buffered = engine->playbackBuffer_.availableRead();
-        const size_t primeFrames = static_cast<size_t>(rate) * PLAYBACK_PRIME_MS / 1000;
-        bool startNow = buffered >= primeFrames;
-        if (!startNow && buffered > 0 && engine->playbackDspInputBuffer_.availableRead() == 0) {
+        // Учитываем и ещё не обработанный DSP вход (24 кГц): предзаполнение может быть длиннее окна DSP
+        const size_t pendingInputAsOutput = static_cast<size_t>(
+            static_cast<uint64_t>(engine->playbackDspInputBuffer_.availableRead()) *
+            static_cast<uint64_t>(rate) / static_cast<uint64_t>(SAMPLE_RATE_GEMINI_OUT));
+        const int32_t primeMs = engine->getEffectivePlaybackPrimeMs();
+        const size_t primeFrames = static_cast<size_t>(rate) * static_cast<size_t>(primeMs) / 1000;
+        bool startNow = buffered > 0 && buffered + pendingInputAsOutput >= primeFrames;
+        if (!startNow && buffered > 0) {
+            // Сеть замолчала (хвост фразы или долгая пачка power-save): играем то, что есть
             const uint64_t lastWrite = engine->lastPlaybackWriteNs_.load(std::memory_order_relaxed);
             timespec tsPrime{};
             clock_gettime(CLOCK_BOOTTIME, &tsPrime);
             const uint64_t nowPrimeNs = static_cast<uint64_t>(tsPrime.tv_sec) * 1000000000ULL +
                                         static_cast<uint64_t>(tsPrime.tv_nsec);
+            const uint64_t idleMs = static_cast<uint64_t>(std::max(PLAYBACK_PRIME_IDLE_MS, primeMs / 2));
             startNow = lastWrite != 0 && nowPrimeNs > lastWrite &&
-                nowPrimeNs - lastWrite >= static_cast<uint64_t>(PLAYBACK_PRIME_IDLE_MS) * 1000000ULL;
+                nowPrimeNs - lastWrite >= idleMs * 1000000ULL;
         }
         if (!startNow) {
             std::memset(samples, 0, frames * sizeof(int16_t));
@@ -1658,6 +1743,18 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
             if (engine->isPlaybackRenderingActive_.load(std::memory_order_relaxed)) {
                 engine->playbackUnderrunFrames_.fetch_add(frames - read, std::memory_order_relaxed);
                 engine->playbackUnderrunCount_.fetch_add(1, std::memory_order_relaxed);
+                // Провал посреди потока (сеть ещё присылает данные): следующее предзаполнение длиннее
+                const uint64_t lastWrite = engine->lastPlaybackWriteNs_.load(std::memory_order_relaxed);
+                timespec tsU{};
+                clock_gettime(CLOCK_BOOTTIME, &tsU);
+                const uint64_t nowU = static_cast<uint64_t>(tsU.tv_sec) * 1000000000ULL +
+                                      static_cast<uint64_t>(tsU.tv_nsec);
+                if (lastWrite != 0 && nowU > lastWrite && nowU - lastWrite < PLAYBACK_REBUFFER_RECENT_WRITE_NS) {
+                    const int32_t boost = std::min(PLAYBACK_REBUFFER_BOOST_MAX_MS,
+                        engine->playbackRebufferBoostMs_.load(std::memory_order_relaxed) + PLAYBACK_REBUFFER_STEP_MS);
+                    engine->playbackRebufferBoostMs_.store(boost, std::memory_order_relaxed);
+                    engine->lastRebufferNs_.store(static_cast<int64_t>(nowU), std::memory_order_relaxed);
+                }
             }
         }
     }
