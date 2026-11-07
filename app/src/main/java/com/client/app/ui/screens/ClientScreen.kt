@@ -141,6 +141,16 @@ fun ClientScreen(
         }
     }
 
+    fun runWithPermissions(action: () -> Unit) {
+        val missing = missingPermissions()
+        if (missing.isEmpty()) {
+            action()
+        } else {
+            pendingAction = action
+            permissionsLauncher.launch(missing.toTypedArray())
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
