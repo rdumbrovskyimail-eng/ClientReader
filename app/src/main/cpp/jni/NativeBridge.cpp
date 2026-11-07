@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <memory>
