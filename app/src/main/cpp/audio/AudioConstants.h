@@ -46,6 +46,17 @@ constexpr int32_t PLAYBACK_FADE_MS = 8;         // затухание/нарас
 constexpr float PLAYBACK_DUCK_GAIN = 0.18f;     // ≈ −15 дБ: модель уступает сразу, без обрыва звука
 constexpr int32_t PLAYBACK_DUCK_RAMP_MS = 25;   // плавность приглушения и возврата громкости
 
+// Фон, блокировка экрана, читалка: Wi-Fi уходит в power-save (low-latency lock действует только
+// при включённом экране и приложении на переднем плане), пакеты приходят пачками. Предзаполнение
+// задаётся из Kotlin профилем буферизации и само растёт после провалов посреди фразы.
+constexpr int32_t PLAYBACK_PRIME_MAX_MS = 1200;          // верхний предел предзаполнения
+constexpr int32_t PLAYBACK_REBUFFER_STEP_MS = 150;       // прибавка после провала посреди потока
+constexpr int32_t PLAYBACK_REBUFFER_BOOST_MAX_MS = 900;  // предел прибавки
+constexpr int64_t PLAYBACK_REBUFFER_DECAY_NS = 30'000'000'000LL; // 30 с без провалов — прибавка сбрасывается
+constexpr uint64_t PLAYBACK_REBUFFER_RECENT_WRITE_NS = 1'500'000'000ULL; // провал при живом потоке сети
+constexpr int32_t PLAYBACK_HARD_PAUSE_FADE_MS = 12;      // затухание перед жёсткой паузой (без щелчка)
+constexpr int NATIVE_DSP_THREAD_NICE = -16;               // ANDROID_PRIORITY_AUDIO для DSP-потоков
+
 // Профили тонкомпенсации выхода
 constexpr int32_t OUTPUT_EQ_SPEAKER = 0;        // встроенный динамик (режим связи)
 constexpr int32_t OUTPUT_EQ_HEADSET_VOICE = 1;  // Bluetooth HFP/SCO (полоса до 8 кГц)
