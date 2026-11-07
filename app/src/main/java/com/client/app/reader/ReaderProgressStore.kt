@@ -83,4 +83,19 @@ class ReaderProgressStore(private val directory: File) {
             text = "",
             segment = root["segment"]?.jsonPrimitive?.intOrNull ?: 0,
             sentence = root["sentence"]?.jsonPrimitive?.intOrNull ?: 0,
-            pace = ReaderPace.from(ro
+            pace = ReaderPace.from(root["pace"]?.jsonPrimitive?.contentOrNull),
+            progress = root["progress"]?.jsonPrimitive?.contentOrNull?.toFloatOrNull() ?: 0f,
+            finished = root["finished"]?.jsonPrimitive?.booleanOrNull ?: false,
+            updatedAtMs = root["updatedAtMs"]?.jsonPrimitive?.longOrNull ?: 0L
+        )
+    }.getOrNull()
+
+    private fun writeAtomically(target: File, content: String) {
+        val tmp = File(target.parentFile, target.name + ".tmp")
+        tmp.writeText(content, Charsets.UTF_8)
+        if (!tmp.renameTo(target)) {
+            target.delete()
+            tmp.renameTo(target)
+        }
+    }
+}
