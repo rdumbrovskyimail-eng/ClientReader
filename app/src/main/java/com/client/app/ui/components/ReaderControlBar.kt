@@ -249,6 +249,7 @@ private fun ColumnScope.FinishedReader(reader: ReaderUiState, onCommand: (Reader
 @Composable
 private fun ColumnScope.SavedReader(reader: ReaderUiState, onResumeSaved: () -> Unit, onDiscardSaved: () -> Unit) {
     val c = Calm.colors
+    val motion = Calm.motion
     var confirmForget by remember { mutableStateOf(false) }
 
     Text(text = "Можно продолжить", style = MaterialTheme.typography.labelMedium, color = c.accentInk)
@@ -272,7 +273,7 @@ private fun ColumnScope.SavedReader(reader: ReaderUiState, onResumeSaved: () -> 
 
     AnimatedContent(
         targetState = confirmForget,
-        transitionSpec = { fadeIn(Calm.motion.fade()) togetherWith fadeOut(Calm.motion.fade()) },
+        transitionSpec = { fadeIn(motion.fade()) togetherWith fadeOut(motion.fade()) },
         label = "saved_actions"
     ) { confirming ->
         if (!confirming) {
