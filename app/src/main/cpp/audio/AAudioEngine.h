@@ -276,7 +276,23 @@ public:
 
     // Мягкая пауза вывода без потери данных (перебивание): позиция очереди удерживается
     void setPlaybackPaused(bool paused);
-    bool isPlaybackPaused() const { return playbackPaused_.load(std::memory_order_acquire); }
+    // true при «приглушении» ИЛИ жёсткой паузе: сторожа зависания записи не считают паузу сбоем
+    bool isPlaybackPaused() const {
+        return playbackPaused_.load(std::memory_order_acquire) ||
+               playbackHardPaused_.load(std::memory_order_acquire);
+    }
+
+    // Жёсткая пауза (читалка, временная потеря аудиофокуса): очередь не читается,
+    // продолжение начинается ровно с того же сэмпла. Управляется только из Kotlin.
+    void setPlaybackHardPaused(bool paused);
+    bool isPlaybackHardPaused() const { return playbackHardPaused_.load(std::memory_order_acquire); }
+
+    // Профиль буферизации вывода: предзаполнение перед стартом фразы и границы цели DSP-очереди (мс)
+    void setPlaybackBufferProfile(int32_t primeMs, int32_t minTargetMs, int32_t maxTargetMs);
+    int32_t getEffectivePlaybackPrimeMs();
+
+    // Спектр для UI: при скрытом интерфейсе FFT не считается (экономия CPU в фоне)
+    void setSpectrumEnabled(bool enabled) { spectrumEnabled_.store(enabled, std::memory_order_relaxed); }
 
     // Тонкомпенсация под маршрут: OUTPUT_EQ_SPEAKER / OUTPUT_EQ_HEADSET_VOICE / OUTPUT_EQ_HEADPHONES
     void setOutputEqProfile(int32_t profile);
@@ -285,7 +301,7 @@ public:
     void setMediaPlaybackUsage(bool enabled) { mediaPlaybackUsage_.store(enabled, std::memory_order_release); }
 
     // Блокирующее ожидание целого кадра захвата (вместо опроса с задержкой 2 мс)
-    bool waitForCaptureFrames(size_t frames, int32_t timeoutMs);
+    bool waitForCaptureFrames(size_frames, int32_t timeoutMs);
     int32_t getCaptureSessionId() const { return captureSessionId_.load(std::memory_order_relaxed); }
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
@@ -542,6 +558,13 @@ private:
 
     // Пауза/предзаполнение/тонкомпенсация вывода
     std::atomic<bool> playbackPaused_{false};
+    std::atomic<bool> playbackHardPaused_{false};
+    std::atomic<int32_t> playbackPrimeBaseMs_{PLAYBACK_PRIME_MS};
+    std::atomic<int32_t> playbackTargetMinMs_{static_cast<int32_t>(PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS)};
+    std::atomic<int32_t> playbackTargetMaxMs_{static_cast<int32_t>(PLAYBACK_TARGET_BUFFER_BT_MAX_MS)};
+    std::atomic<int32_t> playbackRebufferBoostMs_{0};
+    std::atomic<int64_t> lastRebufferNs_{0};
+    std::atomic<bool> spectrumEnabled_{true};
     std::atomic<bool> playbackPrimeRequested_{true};
     std::atomic<int32_t> outputEqProfile_{OUTPUT_EQ_SPEAKER};
     std::atomic<bool> outputEqDirty_{true};
@@ -551,34 +574,4 @@ private:
     bool playbackPriming_{true};
 
     // Захват: сессия эффектов (AEC/NS) и сигнал готовности кадра
-    std::atomic<int32_t> captureSessionId_{0};
-    std::mutex captureReadyMutex_;
-    std::condition_variable captureReadyCv_;
-
-    alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
-    alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
-
-    std::mutex playbackControlMutex_;
-    std::atomic<bool> earconRequested_{false};
-
-    std::unique_ptr<dsp::FastFft> fftProcessor_;
-
-    std::vector<int16_t> playbackDspInputScratch_;
-    std::vector<int16_t> playbackDspOutputScratch_;
-    std::vector<int16_t> earconScratch_;
-
-    std::vector<int16_t> captureRawScratchBuffer_;
-    std::vector<int16_t> captureDecimateBuffer_;
-    std::vector<int16_t> captureInputScratchBuffer_;
-
-    AnalogVoiceEnhancer voiceEnhancer_;
-
-    PolyphaseResampler24To16 resampler24To16_;
-    PolyphaseResampler24To32 resampler24To32_;
-    HalfbandResampler24To48 halfbandResampler24To48_;
-    StreamingLinearResampler genericResampler_;
-
-    UnifiedCaptureResampler unifiedCaptureResampler_;
-};
-
-} // namespace client::audio
+    std::atomic<
