@@ -1,4 +1,3 @@
-
 package com.client.app.audio
 
 import android.content.Context
@@ -60,8 +59,23 @@ enum class CaptureShutdownResult {
 sealed interface AudioFocusEvent {
     data object LossPermanent : AudioFocusEvent
     data object LossTransient : AudioFocusEvent
+    // Короткий системный звук/навигатор: речь не «приглушаем» (теряются слова), а ставим на паузу
+    data object CanDuck : AudioFocusEvent
     data object Gain : AudioFocusEvent
 }
+
+/**
+ * Кто удерживает жёсткую паузу вывода. Пауза активна, пока её держит хотя бы один владелец:
+ * возврат аудиофокуса не снимет паузу, поставленную читалкой, и наоборот.
+ */
+enum class PlaybackHoldOwner { FOCUS, READER, BARGE_IN, USER }
+
+/**
+ * Что делает подтверждённое перебивание:
+ * FLUSH — разговор: ответ модели сбрасывается, слово переходит к пользователю;
+ * HOLD  — читалка: вывод удерживается без потери буфера, решение принимает SessionManager.
+ */
+enum class BargeInMode { FLUSH, HOLD }
 
 enum class AudioEngineState {
     IDLE,
@@ -244,8 +258,13 @@ class NativeAudioEngine @Inject constructor(
     )
     val bargeInEvents: SharedFlow<Unit> = _bargeInEvents.asSharedFlow()
 
-    private val _focusEvents = MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
-    val focusEvents: StateFlow<AudioFocusEvent> = _focusEvents.asStateFlow()
+    // SharedFlow, а не StateFlow: события не склеиваются и начальное «Gain» не приходит подписчику
+    private val _focusEvents = MutableSharedFlow<AudioFocusEvent>(
+        replay = 0,
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val focusEvents: SharedFlow<AudioFocusEvent> = _focusEvents.asSharedFlow()
 
     private val _micOutput = Channel<MicEvent>(
         capacity = Channel.UNLIMITED,
@@ -371,6 +390,77 @@ class NativeAudioEngine @Inject constructor(
     @Volatile private var bargeInTimestampMs = 0L
     private var bargeInLeaseJob: Job? = null
 
+    // Режим перебивания: разговор сбрасывает ответ, читалка удерживает вывод
+    @Volatile var bargeInMode: BargeInMode = BargeInMode.FLUSH
+
+    // Жёсткая пауза вывода и её владельцы (см. PlaybackHoldOwner)
+    private val playbackHolds = HashSet<PlaybackHoldOwner>()
+    @Volatile private var playbackHeld = false
+
+    // Защитное окно после сворачивания/блокировки: касание экрана у нижнего микрофона,
+    // кнопка питания, телефон в кармане не должны считаться перебиванием
+    @Volatile private var handlingGuardUntilMs = 0L
+
+    // Интерфейс скрыт — спектр для FM-ленты не считается
+    @Volatile private var uiVisible = true
+
+    // Кадры 24 кГц, записанные в нативную очередь в текущем поколении воспроизведения (позиция читалки)
+    private val enqueuedModelFrames = AtomicLong(0L)
+
+    val enqueuedFramesInGeneration: Long
+        get() = enqueuedModelFrames.get()
+
+    /** Ещё не прозвучавшие кадры модели (24 кГц) во входной и выходной очередях движка. */
+    fun pendingModelFrames(): Long =
+        (bridge.getPendingPlaybackDurationMs() * 24f).toLong().coerceAtLeast(0L)
+
+    fun setPlaybackHold(owner: PlaybackHoldOwner, held: Boolean) {
+        val changed: Boolean
+        val active: Boolean
+        synchronized(playbackHolds) {
+            changed = if (held) playbackHolds.add(owner) else playbackHolds.remove(owner)
+            active = playbackHolds.isNotEmpty()
+            if (changed) {
+                playbackHeld = active
+                bridge.setPlaybackHardPaused(active)
+            }
+        }
+        if (changed) logger.d("NativeAudioEngine: удержание вывода $owner=${if (held) "вкл" else "выкл"} (активно=$active)")
+    }
+
+    fun isPlaybackHeld(owner: PlaybackHoldOwner? = null): Boolean = synchronized(playbackHolds) {
+        if (owner == null) playbackHolds.isNotEmpty() else owner in playbackHolds
+    }
+
+    fun clearPlaybackHolds() {
+        synchronized(playbackHolds) {
+            playbackHolds.clear()
+            playbackHeld = false
+            bridge.setPlaybackHardPaused(false)
+        }
+    }
+
+    /** Повторно запросить аудиофокус после его постоянной потери (по действию пользователя). */
+    fun reacquireAudioFocus(): Boolean = runCatching { requestAudioFocus() }.getOrDefault(false)
+
+    fun armHandlingGuard(durationMs: Long) {
+        handlingGuardUntilMs = SystemClock.elapsedRealtime() + durationMs.coerceIn(0L, 5_000L)
+    }
+
+    fun setUiVisible(visible: Boolean) {
+        uiVisible = visible
+        bridge.setSpectrumEnabled(visible)
+        if (!visible) {
+            _micLevel.value = 0f
+            _outLevel.value = 0f
+        }
+    }
+
+    /** Профиль буферизации вывода (разговор на экране / фон / читалка). */
+    fun setPlaybackBufferProfile(primeMs: Int, minTargetMs: Int, maxTargetMs: Int) {
+        bridge.setPlaybackBufferProfile(primeMs, minTargetMs, maxTargetMs)
+    }
+
     init {
         engineScope.launch {
             for (req in routeTransitionChannel) {
@@ -425,15 +515,23 @@ class NativeAudioEngine @Inject constructor(
     }
 
     private fun requestAudioFocus(): Boolean {
+        val mediaRoute = router.currentProfile.value.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI
         val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setUsage(if (mediaRoute) AudioAttributes.USAGE_MEDIA else AudioAttributes.USAGE_VOICE_COMMUNICATION)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Повторный запрос — тем же объектом: новый объект = новый клиент фокуса, и старый
+            // получил бы AUDIOFOCUS_LOSS от самого себя
+            focusRequest?.let { existing ->
+                return audioManager.requestAudioFocus(existing) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
             val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(attrs)
                 .setAcceptsDelayedFocusGain(false)
+                // Речь: система не «приглушает» нас сама, а присылает CAN_DUCK — мы ставим паузу
+                .setWillPauseWhenDucked(true)
                 .setOnAudioFocusChangeListener { change ->
                     when (change) {
                         AudioManager.AUDIOFOCUS_LOSS,
@@ -443,6 +541,10 @@ class NativeAudioEngine @Inject constructor(
                                 if (change == AudioManager.AUDIOFOCUS_LOSS) AudioFocusEvent.LossPermanent
                                 else AudioFocusEvent.LossTransient
                             )
+                        }
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                            logger.w("NativeAudioEngine: AudioFocus — короткий звук другого приложения (CAN_DUCK)")
+                            _focusEvents.tryEmit(AudioFocusEvent.CanDuck)
                         }
                         AudioManager.AUDIOFOCUS_GAIN -> {
                             logger.d("NativeAudioEngine: AudioFocus восстановлен")
@@ -907,7 +1009,11 @@ class NativeAudioEngine @Inject constructor(
 
         val paused = u.candidateSinceMs > 0L
         val pendingMs = bridge.getPendingPlaybackDurationMs()
-        val rendering = paused || pendingMs > 1.0f || (now - u.lastOutputActiveMs) < RENDER_TAIL_MS
+        // Жёсткая пауза (читалка/фокус): звук не идёт, хотя очередь полна — речь пользователя
+        // обрабатывается как в тишине, без порогов эха
+        val held = playbackHeld && !paused
+        val rendering = !held && (paused || pendingMs > 1.0f || (now - u.lastOutputActiveMs) < RENDER_TAIL_MS)
+        val guardActive = now < handlingGuardUntilMs
 
         if (rendering && !u.wasRendering) {
             u.renderingStartedMs = now
@@ -947,7 +1053,7 @@ class NativeAudioEngine @Inject constructor(
             if (rendering) {
                 if (!gatedSpeech) bargeInDetector.adapt(micRms, outNow, refMax)
                 val candidate = bargeInDetector.evaluateCandidate(gatedSpeech)
-                if (candidate && localBargeInEnabled && !isBargeInActive && now >= u.refractoryUntilMs) {
+                if (candidate && localBargeInEnabled && !isBargeInActive && !guardActive && now >= u.refractoryUntilMs) {
                     startBargeInCandidate(u, now)
                 }
             } else if (speechActive) {
@@ -956,7 +1062,7 @@ class NativeAudioEngine @Inject constructor(
                 } else {
                     maxOf(0, u.idleSpeechFrames - 2)
                 }
-                if (u.idleSpeechFrames >= IDLE_SPEECH_CONFIRM_FRAMES) {
+                if (u.idleSpeechFrames >= IDLE_SPEECH_CONFIRM_FRAMES && !guardActive) {
                     u.idleSpeechFrames = 0
                     openUplink(u, PRE_ROLL_IDLE_FRAMES, seqNum, captureTimestampNs, instanceId)
                 }
@@ -965,7 +1071,7 @@ class NativeAudioEngine @Inject constructor(
             }
         } else if (rendering) {
             val candidate = bargeInDetector.evaluateCandidate(gatedSpeech)
-            if (candidate && localBargeInEnabled && !isBargeInActive && now >= u.refractoryUntilMs) {
+            if (candidate && localBargeInEnabled && !isBargeInActive && !guardActive && now >= u.refractoryUntilMs) {
                 startBargeInCandidate(u, now)
                 return
             }
@@ -1043,8 +1149,15 @@ class NativeAudioEngine @Inject constructor(
         u.lastOutputActiveMs = 0L
         bargeInDetector.resetStreak()
         activateBargeIn(now)
-        runCatching { bargeInCommitListener?.invoke() }
-        invalidateAndFlushPlayback("local barge-in")
+        if (bargeInMode == BargeInMode.HOLD) {
+            // Читалка: прочитанное не сбрасывается — вывод мгновенно удерживается (жёсткая пауза),
+            // «приглушение» кандидата снимается; продолжение — с того же сэмпла
+            setPlaybackHold(PlaybackHoldOwner.BARGE_IN, true)
+            bridge.setPlaybackPaused(false)
+        } else {
+            runCatching { bargeInCommitListener?.invoke() }
+            invalidateAndFlushPlayback("local barge-in")
+        }
         // Вибрация при перебивании отключена: телефон не должен давать физический отклик
         _bargeInEvents.tryEmit(Unit)
         val framesToSend = (elapsedMs / 10L).toInt() + PRE_ROLL_BARGE_IN_FRAMES
@@ -1180,6 +1293,11 @@ class NativeAudioEngine @Inject constructor(
             spectrumJob = engineScope.launch {
                 var tick = 0
                 while (isActive) {
+                    if (!uiVisible) {
+                        // Экран погашен/приложение свёрнуто: 125 Гц опроса спектра в фоне не нужны
+                        delay(250)
+                        continue
+                    }
                     bridge.getSpectrumData(spectrumRawData)
                     System.arraycopy(spectrumRawData, 0, spectrumUniformUpdate, 0, 5)
                     spectrumUniforms.set(spectrumUniformUpdate.copyOf())
@@ -1485,6 +1603,9 @@ class NativeAudioEngine @Inject constructor(
                     _outLevel.value = 0f
 
                     resetBargeInState()
+                    clearPlaybackHolds()
+                    handlingGuardUntilMs = 0L
+                    bargeInMode = BargeInMode.FLUSH
 
                     synchronized(poolLock) {
                         recycleLeadInBuffersLocked()
@@ -1580,6 +1701,7 @@ class NativeAudioEngine @Inject constructor(
 
     fun invalidateAndFlushPlayback(reason: String = ""): Long {
         val next = playbackGeneration.incrementAndGet().let { if (it <= 0L) 1L else it }
+        enqueuedModelFrames.set(0L)
         bridge.flushPlayback(next)
         _outLevel.value = 0f
         synchronized(poolLock) {
@@ -1600,7 +1722,10 @@ class NativeAudioEngine @Inject constructor(
         playbackStartGeneration.set(generation)
 
         var offset = 0
-        val total = pcm.size
+        // JNI принимает только чётную длину (целые 16-битные сэмплы). Нечётный чанк (3 байта приходят
+        // при «немом» сбое 3.8) раньше возвращал 0 и блокировал конвейер на 1,5 с, а затем терялся.
+        val total = pcm.size and 1.inv()
+        if (total <= 0) return
         var lastSuccessfulWriteMs = SystemClock.elapsedRealtime()
 
         while (offset < total && _isPlaying.value) {
@@ -1621,13 +1746,15 @@ class NativeAudioEngine @Inject constructor(
             if (written > 0) {
                 offset += written
                 lastSuccessfulWriteMs = now
+                enqueuedModelFrames.addAndGet(written / 2L)
             } else {
                 if (generation != currentPlaybackGeneration) return
+                // isPlaybackPaused() учитывает и жёсткую паузу: во время паузы чтения очередь стоит законно
                 if (now - lastSuccessfulWriteMs >= PLAYBACK_WRITE_STALL_TIMEOUT_MS && !bridge.isPlaybackPaused()) {
                     logger.w("NativeAudioEngine: playback write stalled for ${now - lastSuccessfulWriteMs} ms; aborting stuck frame")
                     break
                 }
-                delay(2L)
+                delay(if (playbackHeld) 20L else 2L)
             }
         }
     }
