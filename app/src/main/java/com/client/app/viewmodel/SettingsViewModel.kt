@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.client.app.api.LiveModelCapabilitiesRegistry
 import com.client.app.attach.VocabularyExtractor
 import com.client.app.forvo.ForvoRepository
+import com.client.app.reader.ReaderPace
 import com.client.app.session.SessionManager
 import com.client.app.util.AppLogger
 import com.client.app.util.CryptoManager
@@ -22,7 +23,8 @@ data class AppSettingsState(
     val liveModel: String = SessionManager.DEFAULT_LIVE_MODEL,
     val thinkingLevel: String = "low",
     val analyzerModel: String = VocabularyExtractor.DEFAULT_MODEL,
-    val voice: String = "Charon",
+    // Мужской голос диктора по умолчанию (Charon — «Informative»: ровный, средний тембр)
+    val voice: String = SessionManager.DEFAULT_VOICE,
     val speechLanguage: String = "ru-RU",
     val temperature: Float = 1.0f,
     val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
@@ -41,11 +43,11 @@ data class AppSettingsState(
     val outputTxMode: String = "VERBATIM",
 
     val aadEnabled: Boolean = false,
-    val btHiFiMode: Boolean = false,
+    val btHiFiMode: Boolean = SessionManager.DEFAULT_BT_HIFI,
     val aadStartSensitivity: String = "START_SENSITIVITY_HIGH",
     val aadEndSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
-    val silenceDurationMs: Int = 600,
+    val silenceDurationMs: Int = SessionManager.DEFAULT_SILENCE_DURATION_MS,
     val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
     val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 
@@ -57,7 +59,11 @@ data class AppSettingsState(
     val initialHistoryTurns: Int = 20,
     val enableForvo: Boolean = false,
     val forvoApiKey: String = "",
-    val enableGoogleSearch: Boolean = false
+    val enableGoogleSearch: Boolean = false,
+
+    // Live-читалка
+    val readerPace: String = ReaderPace.MEDIUM.wire,
+    val readerVoiceCommands: Boolean = true
 )
 
 @OptIn(FlowPreview::class)
@@ -134,7 +140,7 @@ class SettingsViewModel @Inject constructor(
                         liveModel = modelId,
                         thinkingLevel = if (capabilities.supportsThinkingConfig) normalizedThinking else "low",
                         analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
-                        voice = p[SessionManager.KEY_VOICE] ?: "Charon",
+                        voice = p[SessionManager.KEY_VOICE]?.ifBlank { null } ?: SessionManager.DEFAULT_VOICE,
                         speechLanguage = p[SessionManager.KEY_SPEECH_LANGUAGE]?.ifBlank { "ru-RU" } ?: "ru-RU",
                         temperature = p[SessionManager.KEY_TEMPERATURE] ?: 1.0f,
                         mediaResolution = p[SessionManager.KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH",
@@ -153,11 +159,11 @@ class SettingsViewModel @Inject constructor(
                         outputTxMode = p[SessionManager.KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM",
 
                         aadEnabled = p[SessionManager.KEY_AAD_ENABLED] ?: false,
-                        btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: false,
+                        btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: SessionManager.DEFAULT_BT_HIFI,
                         aadStartSensitivity = p[SessionManager.KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
                         aadEndSensitivity = p[SessionManager.KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
                         prefixPaddingMs = p[SessionManager.KEY_PREFIX_PADDING_MS] ?: 60,
-                        silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: 600,
+                        silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: SessionManager.DEFAULT_SILENCE_DURATION_MS,
                         activityHandling = p[SessionManager.KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
                         turnCoverage = p[SessionManager.KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 
@@ -173,7 +179,9 @@ class SettingsViewModel @Inject constructor(
                             p[ForvoRepository.KEY_FORVO_API].orEmpty(),
                             "Forvo API key"
                         ),
-                        enableGoogleSearch = p[SessionManager.KEY_ENABLE_SEARCH] ?: false
+                        enableGoogleSearch = p[SessionManager.KEY_ENABLE_SEARCH] ?: false,
+                        readerPace = ReaderPace.from(p[SessionManager.KEY_READER_PACE]).wire,
+                        readerVoiceCommands = p[SessionManager.KEY_READER_VOICE_COMMANDS] ?: true
                     )
                 }
             }
@@ -392,13 +400,12 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setCompressionTokens(trigger: Int, target: Int) {
-        val safeTrigger = trigger.coerceAtLeast(0)
-        val safeTarget = target.coerceAtLeast(0)
-        val validPair = when {
-            safeTarget > 0 -> 0 to safeTarget
-            safeTrigger > 0 -> safeTrigger to 0
-            else -> 0 to 0
-        }
+        // Раньше сохранялось только одно из двух значений (второе обнулялось) — сжатие контекста
+        // работало с непредсказуемым порогом. Теперь сохраняются оба; цель обязана быть меньше порога
+        val safeTrigger = trigger.coerceIn(0, 131_072)
+        var safeTarget = target.coerceIn(0, 131_072)
+        if (safeTrigger > 0 && safeTarget >= safeTrigger) safeTarget = safeTrigger / 2
+        val validPair = safeTrigger to safeTarget
         _settings.update {
             it.copy(
                 compressionTriggerTokens = validPair.first,
@@ -452,5 +459,16 @@ class SettingsViewModel @Inject constructor(
     fun setEnableGoogleSearch(e: Boolean) {
         _settings.update { it.copy(enableGoogleSearch = e) }
         viewModelScope.launch { dataStore.edit { it[SessionManager.KEY_ENABLE_SEARCH] = e } }
+    }
+
+    fun setReaderPace(pace: String) {
+        val normalized = ReaderPace.from(pace).wire
+        _settings.update { it.copy(readerPace = normalized) }
+        viewModelScope.launch { dataStore.edit { it[SessionManager.KEY_READER_PACE] = normalized } }
+    }
+
+    fun setReaderVoiceCommands(enabled: Boolean) {
+        _settings.update { it.copy(readerVoiceCommands = enabled) }
+        viewModelScope.launch { dataStore.edit { it[SessionManager.KEY_READER_VOICE_COMMANDS] = enabled } }
     }
 }
