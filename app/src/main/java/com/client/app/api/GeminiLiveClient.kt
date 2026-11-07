@@ -43,7 +43,9 @@ sealed interface GeminiEvent {
     ) : GeminiEvent
 
     data class OutputTranscript(
-        val text: String
+        val text: String,
+        // Сколько байт аудио этой генерации принято к моменту фрагмента транскрипции (позиция в звуке)
+        val turnAudioBytes: Long = 0L
     ) : GeminiEvent
 
     data class ToolCall(
@@ -149,7 +151,9 @@ class AudioFrame(
     var timestampMs: Long = SystemClock.elapsedRealtime(),
     var sequenceNumber: Long = 0L,
     var timestampNs: Long = SystemClock.elapsedRealtimeNanos(),
-    var ttlMs: Long = 500L
+    var ttlMs: Long = 500L,
+    // Номер генерации сервера (хода модели): связывает звук с фрагментом читалки и сторожем 3.8
+    var serverTurnId: Long = 0L
 ) {
     fun isExpired(nowMs: Long = SystemClock.elapsedRealtime()): Boolean =
         (nowMs - timestampMs) > ttlMs
@@ -203,7 +207,12 @@ data class LiveModelCapabilities(
     val requiresNonBlockingTools: Boolean,
     val supportsSearchGrounding: Boolean,
     val supportsUrlContext: Boolean,
-    val maxInputTokens: Int
+    val maxInputTokens: Int,
+    // gemini-3.8-live игнорирует audioStreamEnd как границу хода: серверному VAD нужен непрерывный
+    // поток (в т.ч. тишина), иначе ход «зависает» (подтверждено измерениями, openclaw PR #152844)
+    val endsTurnOnAudioStreamEnd: Boolean = true,
+    // 3.8: clientContent принимается в любой момент сессии (3.1 — только для начальной истории)
+    val supportsMidSessionClientContent: Boolean = true
 )
 
 object LiveModelCapabilitiesRegistry {
@@ -247,7 +256,9 @@ object LiveModelCapabilitiesRegistry {
                 requiresNonBlockingTools = false,
                 supportsSearchGrounding = true,
                 supportsUrlContext = false,
-                maxInputTokens = 131_072
+                maxInputTokens = 131_072,
+                endsTurnOnAudioStreamEnd = false,
+                supportsMidSessionClientContent = true
             )
             "gemini-3.8-live-extended-thinking" -> LiveModelCapabilities(
                 supportsThinkingConfig = true,
@@ -258,7 +269,9 @@ object LiveModelCapabilitiesRegistry {
                 requiresNonBlockingTools = true,
                 supportsSearchGrounding = true,
                 supportsUrlContext = false,
-                maxInputTokens = 131_072
+                maxInputTokens = 131_072,
+                endsTurnOnAudioStreamEnd = false,
+                supportsMidSessionClientContent = true
             )
             "gemini-3.1-flash-live-preview" -> LiveModelCapabilities(
                 supportsThinkingConfig = true,
@@ -269,7 +282,9 @@ object LiveModelCapabilitiesRegistry {
                 requiresNonBlockingTools = false,
                 supportsSearchGrounding = false,
                 supportsUrlContext = false,
-                maxInputTokens = 131_072
+                maxInputTokens = 131_072,
+                endsTurnOnAudioStreamEnd = true,
+                supportsMidSessionClientContent = false
             )
             "gemini-2.5-flash-native-audio-preview-12-2025" -> LiveModelCapabilities(
                 supportsThinkingConfig = false,
@@ -280,7 +295,9 @@ object LiveModelCapabilitiesRegistry {
                 requiresNonBlockingTools = false,
                 supportsSearchGrounding = false,
                 supportsUrlContext = false,
-                maxInputTokens = 131_072
+                maxInputTokens = 131_072,
+                endsTurnOnAudioStreamEnd = true,
+                supportsMidSessionClientContent = false
             )
             else -> throw IllegalArgumentException(
                 "Unsupported Gemini Live model '${normalize(model)}'. Add it to LiveModelCapabilitiesRegistry only after verifying its official protocol contract."
@@ -358,7 +375,17 @@ class GeminiLiveClient @Inject constructor(
     suspend fun sendClientContent(
         turns: List<ClientTurn>,
         turnComplete: Boolean = true
-    ) = protobufClient.sendClientContent(turns, turnComplete)
+    ): Boolean = protobufClient.sendClientContent(turns, turnComplete)
+
+    val isGenerationInProgress: Boolean
+        get() = protobufClient.isGenerationInProgress
+
+    val activeServerTurnId: Long
+        get() = protobufClient.activeServerTurnId
+
+    fun pendingTransportAudioBytes(): Long = protobufClient.pendingTransportAudioBytes()
+
+    fun suppressActiveServerGeneration() = protobufClient.suppressActiveServerGeneration()
 
     suspend fun sendAudioStreamEnd() =
         protobufClient.sendAudioStreamEnd()
