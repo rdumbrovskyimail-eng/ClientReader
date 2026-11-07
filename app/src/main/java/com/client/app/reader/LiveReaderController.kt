@@ -1356,7 +1356,10 @@ class LiveReaderController(
             pace = pace,
             pauseReason = pauseReason,
             savedTitle = if (doc == null) savedTitle else null,
-            savedProgress = savedProgress
+            savedProgress = savedProgress,
+            sentence = if (doc != null && status != ReaderStatus.FINISHED) doc.sentenceText(position) else "",
+            nextSentence = if (doc != null && status != ReaderStatus.FINISHED) doc.sentenceText(doc.nextSentence(position)) else "",
+            totalChars = doc?.text?.length ?: 0
         )
     }
 
