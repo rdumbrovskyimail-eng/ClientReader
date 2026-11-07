@@ -15,6 +15,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.client.app.logging.AppLogManager
+import com.client.app.session.SessionManager
 import com.client.app.ui.display.DisplayRateManager
 import com.client.app.ui.screens.ClientScreen
 import com.client.app.ui.screens.LogViewerScreen
@@ -51,6 +52,9 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var logManager: AppLogManager
+
+    @Inject
+    lateinit var sessionManager: SessionManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -125,6 +129,18 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // Видимость интерфейса: в фоне — больший запас буфера вывода (Wi-Fi power-save), без расчёта спектра,
+    // с защитным окном от «шумов касания» при сворачивании/блокировке
+    override fun onStart() {
+        super.onStart()
+        sessionManager.onUiVisibilityChanged(true)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        sessionManager.onUiVisibilityChanged(false)
     }
 
     override fun onResume() {
