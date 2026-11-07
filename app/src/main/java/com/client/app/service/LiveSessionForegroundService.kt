@@ -2,8 +2,10 @@ package com.client.app.service
 
 import android.Manifest
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
@@ -17,14 +19,18 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.media.app.NotificationCompat.MediaStyle
 import com.client.app.MainActivity
+import com.client.app.reader.ReaderCommand
+import com.client.app.reader.ReaderStatus
 import com.client.app.session.LinkState
 import com.client.app.session.SessionManager
+import com.client.app.session.SessionState
 import com.client.app.util.AppLogger
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
@@ -124,7 +130,13 @@ class LiveSessionForegroundService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    // Android 10–13: LOW_LATENCY действует только на экране; при погашенном экране нужен HIGH_PERF,
+    // иначе Wi-Fi уходит в power-save, пакеты приходят пачками и звук рвётся/«глохнет»
+    private var wifiLockBackground: WifiManager.WifiLock? = null
     private var mediaSession: MediaSessionCompat? = null
+    private var screenReceiver: BroadcastReceiver? = null
+    private var lastNotificationKey: String? = null
+    private var lastMetadataTitle: String? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var mediaObserverJob: Job? = null
@@ -136,6 +148,7 @@ class LiveSessionForegroundService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.client.app.action.STOP"
+        const val ACTION_PLAY_PAUSE = "com.client.app.action.PLAY_PAUSE"
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "live_client_voice_channel"
 
@@ -173,6 +186,7 @@ class LiveSessionForegroundService : Service() {
         createNotificationChannel()
         initMediaSession()
         initNetworkMonitoring()
+        registerScreenReceiver()
 
         powerTracker = SessionPowerBudgetTracker(this, logger).apply {
             onSessionStarted()
@@ -191,23 +205,93 @@ class LiveSessionForegroundService : Service() {
                 // УСТРАНЕНИЕ ДЕФЕКТА 179: Динамическое управление блокировкой Wi-Fi
                 updateWifiLockState(isLive)
 
-                val mediaState = when {
-                    state.link != LinkState.IDLE -> PlaybackStateCompat.STATE_PLAYING
-                    else -> PlaybackStateCompat.STATE_STOPPED
-                }
-                mediaSession?.setPlaybackState(
-                    PlaybackStateCompat.Builder()
-                        .setActions(PlaybackStateCompat.ACTION_STOP)
-                        .setState(mediaState, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
-                        .build()
-                )
+                updateMediaSession(state)
+                updateNotificationIfNeeded(state)
             }
         }
+    }
+
+    /**
+     * Кнопки гарнитуры, экрана блокировки и часов: Play/Pause — пауза/продолжение чтения (или ответа),
+     * «вперёд» — следующий абзац, «назад» — повтор предложения. Состояние PLAYING/PAUSED нужно системе,
+     * чтобы медиакнопки приходили именно в эту сессию.
+     */
+    private fun updateMediaSession(state: SessionState) {
+        val session = mediaSession ?: return
+        val reader = state.reader
+        val mediaState = when {
+            reader.isActive && reader.status == ReaderStatus.PAUSED -> PlaybackStateCompat.STATE_PAUSED
+            reader.isActive -> PlaybackStateCompat.STATE_PLAYING
+            state.link != LinkState.IDLE -> PlaybackStateCompat.STATE_PLAYING
+            else -> PlaybackStateCompat.STATE_STOPPED
+        }
+        var actions = PlaybackStateCompat.ACTION_STOP or
+            PlaybackStateCompat.ACTION_PLAY or
+            PlaybackStateCompat.ACTION_PAUSE or
+            PlaybackStateCompat.ACTION_PLAY_PAUSE
+        if (reader.isActive) {
+            actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+        }
+        session.setPlaybackState(
+            PlaybackStateCompat.Builder()
+                .setActions(actions)
+                .setState(mediaState, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, if (mediaState == PlaybackStateCompat.STATE_PLAYING) 1.0f else 0.0f)
+                .build()
+        )
+        val title = if (reader.isActive) reader.title.ifBlank { "Чтение" } else "Gemini Live"
+        if (title != lastMetadataTitle) {
+            lastMetadataTitle = title
+            session.setMetadata(
+                MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, "Gemini Live")
+                    .build()
+            )
+        }
+    }
+
+    /** Уведомление перестраивается только при смене статуса/заголовка/каждых 5 % прогресса. */
+    private fun updateNotificationIfNeeded(state: SessionState) {
+        val reader = state.reader
+        val key = "${state.link}|${reader.status}|${reader.title}|${(reader.progress * 20).toInt()}"
+        if (key == lastNotificationKey) return
+        lastNotificationKey = key
+        if (!_isServiceActive.value) return
+        runCatching {
+            getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, buildNotification(state))
+        }
+    }
+
+    /** Экран включён/выключен: SessionManager меняет запас буфера и включает защитное окно от касаний. */
+    private fun registerScreenReceiver() {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> sessionManager.onScreenInteractiveChanged(true)
+                    Intent.ACTION_SCREEN_OFF -> sessionManager.onScreenInteractiveChanged(false)
+                }
+                updateWifiLockState(sessionManager.state.value.link == LinkState.LIVE)
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        runCatching {
+            ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            screenReceiver = receiver
+        }.onFailure { logger.w("LiveSessionForegroundService: приёмник экрана не зарегистрирован: ${it.message}") }
+        val pm = getSystemService(POWER_SERVICE) as? PowerManager
+        sessionManager.onScreenInteractiveChanged(pm?.isInteractive ?: true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             sessionManager.stopSession()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_PLAY_PAUSE) {
+            sessionManager.mediaPlayPause()
             return START_NOT_STICKY
         }
 
@@ -278,12 +362,29 @@ class LiveSessionForegroundService : Service() {
                 }
                 powerTracker?.onWifiLockStateChanged(true)
             }
+            // LOW_LATENCY работает только при включённом экране и приложении на переднем плане.
+            // Android 10–13: для погашенного экрана дополнительно HIGH_PERF (на 14+ он не действует —
+            // там непрерывность обеспечивает увеличенный буфер вывода, см. SessionManager)
+            if (Build.VERSION.SDK_INT in Build.VERSION_CODES.Q until Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+                wifiLockBackground?.isHeld != true
+            ) {
+                runCatching {
+                    val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                    @Suppress("DEPRECATION")
+                    wifiLockBackground = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "client:live_session_wifi_bg").apply {
+                        setReferenceCounted(false)
+                        acquire()
+                    }
+                }
+            }
         } else {
             if (wifiLock?.isHeld == true) {
                 runCatching { wifiLock?.release() }
                 wifiLock = null
                 powerTracker?.onWifiLockStateChanged(false)
             }
+            if (wifiLockBackground?.isHeld == true) runCatching { wifiLockBackground?.release() }
+            wifiLockBackground = null
         }
     }
 
@@ -305,12 +406,20 @@ class LiveSessionForegroundService : Service() {
             mediaSession = MediaSessionCompat(this, "GeminiLiveMediaSession").apply {
                 setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS)
                 setCallback(object : MediaSessionCompat.Callback() {
+                    override fun onPlay() = sessionManager.mediaPlay()
+                    override fun onPause() = sessionManager.mediaPause()
+                    override fun onSkipToNext() {
+                        sessionManager.readerCommand(ReaderCommand.NextParagraph)
+                    }
+                    override fun onSkipToPrevious() {
+                        sessionManager.readerCommand(ReaderCommand.RepeatSentence)
+                    }
                     override fun onStop() {
                         sessionManager.stopSession()
                     }
                 })
                 val state = PlaybackStateCompat.Builder()
-                    .setActions(PlaybackStateCompat.ACTION_STOP)
+                    .setActions(PlaybackStateCompat.ACTION_STOP or PlaybackStateCompat.ACTION_PLAY_PAUSE)
                     .setState(PlaybackStateCompat.STATE_STOPPED, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 0.0f)
                     .build()
                 setPlaybackState(state)
@@ -320,7 +429,7 @@ class LiveSessionForegroundService : Service() {
     }
 
     private fun promoteToForeground(): Boolean {
-        val notification = buildNotification()
+        val notification = buildNotification(if (::sessionManager.isInitialized) sessionManager.state.value else null)
         val hasMic = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.RECORD_AUDIO
@@ -376,7 +485,7 @@ class LiveSessionForegroundService : Service() {
         }
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(state: SessionState?): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -397,23 +506,50 @@ class LiveSessionForegroundService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val playPausePendingIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, LiveSessionForegroundService::class.java).apply { action = ACTION_PLAY_PAUSE },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val reader = state?.reader
+        val reading = reader?.isActive == true
+        val title = if (reading) "Чтение: ${reader!!.title.ifBlank { "текст" }}" else "Gemini Live активен"
+        val text = when {
+            reading && reader!!.status == ReaderStatus.PAUSED -> "Пауза · ${(reader.progress * 100).toInt()}% · «Продолжить» — кнопкой или голосом"
+            reading -> "${(reader!!.progress * 100).toInt()}% · фрагмент ${reader.segment + 1} из ${reader.totalSegments}"
+            else -> "Фоновая Gemini Live-сессия активна"
+        }
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Gemini Live Ultra активен")
-            .setContentText("Фоновая Gemini Live-сессия активна")
+            .setContentTitle(title)
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Завершить",
-                stopPendingIntent
-            )
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+
+        val paused = reading && reader!!.status == ReaderStatus.PAUSED
+        builder.addAction(
+            if (paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
+            if (paused) "Продолжить" else "Пауза",
+            playPausePendingIntent
+        )
+        builder.addAction(
+            android.R.drawable.ic_menu_close_clear_cancel,
+            "Завершить",
+            stopPendingIntent
+        )
 
         mediaSession?.let { session ->
             builder.setStyle(
                 MediaStyle()
                     .setMediaSession(session.sessionToken)
-                    .setShowActionsInCompactView(0)
+                    .setShowActionsInCompactView(0, 1)
             )
         }
 
@@ -440,6 +576,13 @@ class LiveSessionForegroundService : Service() {
             if (wifiLock?.isHeld == true) wifiLock?.release()
         }
         wifiLock = null
+        runCatching {
+            if (wifiLockBackground?.isHeld == true) wifiLockBackground?.release()
+        }
+        wifiLockBackground = null
+
+        screenReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
+        screenReceiver = null
 
         runCatching {
             mediaSession?.isActive = false
