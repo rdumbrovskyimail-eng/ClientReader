@@ -48,7 +48,7 @@ class ReadingTextSegmenter(
 
     fun normalizeToParagraphs(raw: String): List<String> {
         var s = raw.replace("\r\n", "\n").replace('\r', '\n')
-        s = s.replace("­", "")
+        s = s.replace("\u00AD", "") // мягкий перенос (soft hyphen)
         s = INVISIBLE.replace(s, "")
         s = WIDE_SPACES.replace(s, " ")
         // «сло-\nво» → «слово» (перенос по слогам при копировании из PDF)
@@ -285,9 +285,10 @@ class ReadingTextSegmenter(
         private val DASHES = setOf('—', '–', '-')
         private val SOFT_BREAK_PRIORITY = listOf(setOf(';'), setOf(':', '—', '–'), setOf(','))
 
-        private val INVISIBLE = Regex("[​‌‍⁠﻿]")
-        private val WIDE_SPACES = Regex("[     \t]")
-        private val SYLLABLE_WRAP = Regex("(\\p{L})[-‐‑]\\n(\\p{Ll})")
+        // Символы нулевой ширины и BOM (\uFEFF) экранированы через \uXXXX, чтобы не триггерить Android Lint [ByteOrderMark]
+        private val INVISIBLE = Regex("[\u200B\u200C\u200D\u2060\uFEFF]")
+        private val WIDE_SPACES = Regex("[\u00A0\u2007\u202F\u2009\u200A\t]")
+        private val SYLLABLE_WRAP = Regex("(\\p{L})[-\\u2010\\u2011]\\n(\\p{Ll})")
         private val MULTI_SPACE = Regex(" {2,}")
         private val LIST_MARKER = Regex("^([-–—•*·▪●]|\\d{1,3}[.)]|[a-zа-яё][)])\\s")
         private val SENTENCE_END_AT_LINE_END = Regex("[.!?…:;][»\"”’)\\]]*$")
