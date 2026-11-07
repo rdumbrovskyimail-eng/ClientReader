@@ -26,6 +26,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.media.app.NotificationCompat.MediaStyle
 import com.client.app.MainActivity
+import com.client.app.R
 import com.client.app.reader.ReaderCommand
 import com.client.app.reader.ReaderStatus
 import com.client.app.session.LinkState
@@ -515,17 +516,19 @@ class LiveSessionForegroundService : Service() {
 
         val reader = state?.reader
         val reading = reader?.isActive == true
-        val title = if (reading) "Чтение: ${reader!!.title.ifBlank { "текст" }}" else "Gemini Live активен"
+        val title = if (reading) "Чтение: ${reader!!.title.ifBlank { "текст" }}" else "Gemini на связи"
         val text = when {
-            reading && reader!!.status == ReaderStatus.PAUSED -> "Пауза · ${(reader.progress * 100).toInt()}% · «Продолжить» — кнопкой или голосом"
-            reading -> "${(reader!!.progress * 100).toInt()}% · фрагмент ${reader.segment + 1} из ${reader.totalSegments}"
-            else -> "Фоновая Gemini Live-сессия активна"
+            reading && reader!!.status == ReaderStatus.PAUSED -> "Пауза · ${(reader.progress * 100).toInt()} % · продолжить — кнопкой или голосом"
+            reading -> "${(reader!!.progress * 100).toInt()} % · фрагмент ${reader.segment + 1} из ${reader.totalSegments}"
+            else -> "Разговор идёт в фоне · завершить можно здесь"
         }
 
+        // Спокойное оформление: собственный одноцветный значок «полутоновый голос» и приглушённый акцент
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_notification_voice)
+            .setColor(getColor(R.color.calm_notification))
             .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
