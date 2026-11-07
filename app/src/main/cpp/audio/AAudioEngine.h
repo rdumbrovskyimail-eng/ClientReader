@@ -529,8 +529,8 @@ private:
     std::vector<int16_t> captureDecimateBuffer_;
     std::vector<int16_t> captureInputScratchBuffer_;
 
-    std::atomic<uint64_t> playbackEpoch_{1};
-    std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
+    alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
+    alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
     std::atomic<bool> earconRequested_{false};
     std::mutex playbackControlMutex_;
 };
