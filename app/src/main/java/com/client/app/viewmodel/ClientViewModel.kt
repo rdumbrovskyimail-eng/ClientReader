@@ -1,10 +1,10 @@
-// >>> FILE: app/src/main/java/com/client/app/viewmodel/ClientViewModel.kt
 package com.client.app.viewmodel
 
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
+import com.client.app.reader.ReaderCommand
 import com.client.app.session.ForvoWord
 import com.client.app.session.SessionManager
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -32,4 +32,10 @@ class ClientViewModel @Inject constructor(
     fun clearForvo() = sessionManager.clearForvo()
     fun clearError() = sessionManager.clearError()
     fun clearChat() = sessionManager.clearChat()
+
+    // --- Live-читалка ---
+    fun startReading(text: String) = sessionManager.startReading(text)
+    fun readerCommand(command: ReaderCommand) = sessionManager.readerCommand(command)
+    fun resumeSavedReading() = sessionManager.resumeSavedReading()
+    fun discardSavedReading() = sessionManager.discardSavedReading()
 }
