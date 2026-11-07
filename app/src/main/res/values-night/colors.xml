@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- «Тихий свет»: сумеречная тема окна — глубокий сланец вместо чёрного. -->
+<resources>
+    <color name="calm_canvas">#151A1A</color>
+    <color name="calm_raised">#1C2222</color>
+    <color name="calm_ink">#E1E5E2</color>
+    <color name="calm_accent">#8FBAB0</color>
+    <color name="calm_icon_plate">#2A4540</color>
+</resources>
