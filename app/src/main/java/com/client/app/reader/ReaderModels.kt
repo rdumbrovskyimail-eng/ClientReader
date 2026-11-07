@@ -114,6 +114,25 @@ class ReaderDocument(
     }
 
     fun isEnd(position: ReaderPosition): Boolean = position.segment >= segments.size
+
+    /** Текст предложения в позиции [position] (для «телесуфлёра» на экране); пусто за концом документа. */
+    fun sentenceText(position: ReaderPosition): String {
+        val seg = segments.getOrNull(position.segment) ?: return ""
+        val s = seg.sentences.getOrNull(position.sentence) ?: return ""
+        val from = s.start.coerceIn(0, text.length)
+        val to = s.end.coerceIn(from, text.length)
+        return text.substring(from, to).trim()
+    }
+
+    /** Следующее предложение (через границу фрагмента). */
+    fun nextSentence(position: ReaderPosition): ReaderPosition {
+        val seg = segments.getOrNull(position.segment) ?: return ReaderPosition(segments.size, 0)
+        return if (position.sentence + 1 < seg.sentences.size) {
+            ReaderPosition(position.segment, position.sentence + 1)
+        } else {
+            ReaderPosition(position.segment + 1, 0)
+        }
+    }
 }
 
 data class ReaderPosition(val segment: Int, val sentence: Int) : Comparable<ReaderPosition> {
@@ -135,7 +154,13 @@ data class ReaderUiState(
     val pace: ReaderPace = ReaderPace.MEDIUM,
     val pauseReason: PauseReason = PauseReason.NONE,
     val savedTitle: String? = null,
-    val savedProgress: Float = 0f
+    val savedProgress: Float = 0f,
+    /** Предложение, которое звучит сейчас (или с которого продолжится чтение). */
+    val sentence: String = "",
+    /** Следующее предложение — показывается приглушённо. */
+    val nextSentence: String = "",
+    /** Длина документа в символах — для оценки оставшегося времени. */
+    val totalChars: Int = 0
 ) {
     val isActive: Boolean
         get() = status != ReaderStatus.IDLE && status != ReaderStatus.FINISHED && status != ReaderStatus.ERROR
