@@ -20,7 +20,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          lfs: true
+          lfs: false
 
       - name: Fetch and Validate Silero V5 Model
         shell: bash
@@ -28,20 +28,23 @@ jobs:
           set -euo pipefail
           MODEL_PATH="app/src/main/assets/models/silero_vad_v5_quant.onnx"
           test -f "$MODEL_PATH" || { echo "Missing Silero V5 model in repository"; exit 1; }
-# LFS — только если файл действительно отслеживается LFS (после переноса в обычный git — пропуск)
+
+          # Если файл всё ещё отслеживается через LFS, пробуем подтянуть
           if git check-attr filter -- "$MODEL_PATH" | grep -q "filter: lfs"; then
-            git lfs pull --include="$MODEL_PATH"
-            git lfs checkout -- "$MODEL_PATH"
+            git lfs pull --include="$MODEL_PATH" || true
+            git lfs checkout -- "$MODEL_PATH" || true
           fi
+
           test -s "$MODEL_PATH"
           SIZE_BYTES="$(stat -c%s "$MODEL_PATH")"
-          test "$SIZE_BYTES" -ge 500000 || { echo "Silero V5 model is too small: $SIZE_BYTES"; exit 1; }
+          test "$SIZE_BYTES" -ge 500000 || { echo "Silero V5 model is too small: $SIZE_BYTES bytes (expected ~2.3 MB)"; exit 1; }
+
           if head -c 128 "$MODEL_PATH" | grep -aq "git-lfs.github.com/spec"; then
-            echo "Silero V5 model is still an LFS pointer"; exit 1
+            echo "Error: Silero V5 model is still an LFS text pointer, not the real binary file!"
+            exit 1
           fi
-          echo "Silero V5 model SHA-256 (must be reviewed against the pinned repository artifact):"
-          sha256sum "$MODEL_PATH"
-          # Закреплённая модель: silero_vad.onnx из официального пакета silero-vad 6.2.0 (MIT)
+
+          echo "Silero V5 model SHA-256 verification:"
           echo "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3  $MODEL_PATH" | sha256sum -c -
 
       - name: Set up JDK 17
