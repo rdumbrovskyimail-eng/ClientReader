@@ -2,7 +2,9 @@ package com.client.app.ui.screens
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -40,7 +42,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.client.app.reader.ReaderPace
 import com.client.app.viewmodel.SettingsViewModel
 
 // Чёрная палитра экрана настроек (имена сохранены ради точечной правки, значения инвертированы)
@@ -105,39 +109,50 @@ fun SettingsScreen(
     var silenceDurationDraft by remember(settings.silenceDurationMs) { mutableIntStateOf(settings.silenceDurationMs) }
     var historyTurnsDraft by remember(settings.initialHistoryTurns) { mutableIntStateOf(settings.initialHistoryTurns) }
 
-    // 30 голосов Live API (официальный список Google); тёплые и мягкие — первыми
+    // 30 голосов Live API (официальный список Google). Первыми — мужские голоса, подходящие для
+    // дикторского чтения (средний тембр, ровная подача); ♂/♀ — пол голоса
     val liveVoices = listOf(
-        "Sulafat" to "тёплый",
-        "Achernar" to "мягкий",
-        "Vindemiatrix" to "нежный",
-        "Achird" to "дружелюбный",
-        "Charon" to "информативный",
-        "Algieba" to "плавный",
-        "Despina" to "плавный",
-        "Umbriel" to "непринуждённый",
-        "Callirrhoe" to "непринуждённый",
-        "Gacrux" to "зрелый",
-        "Schedar" to "ровный",
-        "Iapetus" to "чёткий",
-        "Erinome" to "чёткий",
-        "Rasalgethi" to "информативный",
-        "Sadaltager" to "эрудированный",
-        "Zubenelgenubi" to "расслабленный",
-        "Enceladus" to "с придыханием",
-        "Aoede" to "лёгкий",
-        "Kore" to "твёрдый",
-        "Orus" to "твёрдый",
-        "Alnilam" to "твёрдый",
-        "Algenib" to "с хрипотцой",
-        "Pulcherrima" to "напористый",
-        "Leda" to "молодой",
-        "Puck" to "бодрый",
-        "Laomedeia" to "бодрый",
-        "Zephyr" to "яркий",
-        "Autonoe" to "яркий",
-        "Sadachbia" to "живой",
-        "Fenrir" to "эмоциональный"
+        "Charon" to "♂ информативный · диктор",
+        "Schedar" to "♂ ровный",
+        "Algieba" to "♂ плавный",
+        "Iapetus" to "♂ чёткий",
+        "Sadaltager" to "♂ эрудированный",
+        "Rasalgethi" to "♂ информативный",
+        "Achird" to "♂ дружелюбный",
+        "Umbriel" to "♂ непринуждённый",
+        "Orus" to "♂ твёрдый",
+        "Alnilam" to "♂ твёрдый",
+        "Zubenelgenubi" to "♂ расслабленный",
+        "Enceladus" to "♂ с придыханием",
+        "Algenib" to "♂ с хрипотцой",
+        "Puck" to "♂ бодрый",
+        "Sadachbia" to "♂ живой",
+        "Fenrir" to "♂ эмоциональный",
+        "Sulafat" to "♀ тёплый",
+        "Achernar" to "♀ мягкий",
+        "Vindemiatrix" to "♀ нежный",
+        "Despina" to "♀ плавный",
+        "Callirrhoe" to "♀ непринуждённый",
+        "Gacrux" to "♀ зрелый",
+        "Erinome" to "♀ чёткий",
+        "Aoede" to "♀ лёгкий",
+        "Kore" to "♀ твёрдый",
+        "Pulcherrima" to "♀ напористый",
+        "Leda" to "♀ молодой",
+        "Laomedeia" to "♀ бодрый",
+        "Zephyr" to "♀ яркий",
+        "Autonoe" to "♀ яркий"
     )
+
+    // Исключение из оптимизации батареи: перепроверяется при каждом возврате на экран
+    val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
+    var batteryUnrestricted by remember {
+        mutableStateOf(powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true)
+    }
+    LifecycleResumeEffect(Unit) {
+        batteryUnrestricted = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+        onPauseOrDispose { }
+    }
 
     val resolutions = listOf("MEDIA_RESOLUTION_HIGH", "MEDIA_RESOLUTION_MEDIUM", "MEDIA_RESOLUTION_LOW")
     val txModes = listOf("VERBATIM", "SMART")
@@ -256,6 +271,16 @@ fun SettingsScreen(
                     }
                 }
 
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Диалог: gemini-3.8-live — самый быстрый отклик; …-extended-thinking — умнее в сложных " +
+                        "вопросах (лидер голосовых бенчмарков), но с паузой на размышление. " +
+                        "Чтение вслух всегда идёт на gemini-3.8-live: минимальная задержка и «тихие» команды.",
+                    color = ColorTextMuted,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Vision OCR анализатор:", color = ColorTextSecondary, fontSize = 12.sp)
@@ -309,7 +334,7 @@ fun SettingsScreen(
 
             // 3. ГОЛОС И ЯЗЫК СИНТЕЗА
             SettingsCard(title = "3. ГОЛОС И ЯЗЫК СИНТЕЗА") {
-                Text("Голос ассистента (voiceName):", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
+                Text("Голос (voiceName). Для чтения — мужские дикторские: Charon, Schedar, Algieba, Iapetus", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -337,6 +362,59 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(10.dp),
                     colors = whiteFieldColors()
+                )
+            }
+
+            // 3.1 LIVE-ЧИТАЛКА
+            SettingsCard(title = "3.1 ЧТЕНИЕ ВСЛУХ (LIVE-ЧИТАЛКА)") {
+                Text("Темп диктора:", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ReaderPace.entries.forEach { pace ->
+                        FilterChip(
+                            selected = settings.readerPace == pace.wire,
+                            onClick = {
+                                performSettingsHaptic(context)
+                                viewModel.setReaderPace(pace.wire)
+                            },
+                            label = { Text(pace.label, fontSize = 11.5.sp) },
+                            colors = whiteChipColors()
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Голосовые команды во время чтения", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text(
+                            "«стоп / пауза», «продолжай», «повтори», «повтори абзац», «дальше / пропусти», " +
+                                "«медленнее / быстрее», «громче / тише», «закончи чтение»; вопрос по тексту — " +
+                                "короткий ответ и пауза",
+                            color = ColorTextMuted,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
+                        )
+                    }
+                    Switch(
+                        checked = settings.readerVoiceCommands,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setReaderVoiceCommands(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Текст вставляется в редактор промпта → кнопка «Читать». Место остановки сохраняется: " +
+                        "тот же текст продолжится с прерванного предложения даже после перезапуска.",
+                    color = ColorTextMuted,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
                 )
             }
 
@@ -564,6 +642,17 @@ fun SettingsScreen(
                     )
                 }
 
+                // Действует и в ручном режиме (по умолчанию): это «хвост» локального VAD перед activityEnd
+                Spacer(Modifier.height(8.dp))
+                Text("Пауза конца фразы: ${silenceDurationDraft} мс (по умолчанию 700)", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
+                Slider(
+                    value = silenceDurationDraft.toFloat(),
+                    onValueChange = { silenceDurationDraft = it.toInt() },
+                    onValueChangeFinished = { viewModel.setSilenceDurationMs(silenceDurationDraft) },
+                    valueRange = 300f..1500f,
+                    colors = whiteSliderColors()
+                )
+
                 Spacer(Modifier.height(8.dp))
                 Text("Политика перебивания (activityHandling):", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(6.dp))
@@ -747,8 +836,14 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    text = "Для предотвращения засыпания микрофона при отключенном экране выберите режим работы батареи «Без ограничений».",
-                    color = ColorTextSecondary,
+                    text = if (batteryUnrestricted) {
+                        "Батарея: без ограничений — фоновая сессия не усыпляется."
+                    } else {
+                        "Батарея: ОПТИМИЗИРУЕТСЯ. При погашенном экране система может душить сеть и микрофон — " +
+                            "чтение и ответы будут обрываться. Нажмите кнопку ниже и разрешите работу без ограничений. " +
+                            "Samsung: также уберите приложение из «Спящих» (Батарея → Ограничения фоновой работы)."
+                    },
+                    color = if (batteryUnrestricted) ColorTextSecondary else Color(0xFFEA4335),
                     fontSize = 11.5.sp,
                     lineHeight = 15.sp
                 )
@@ -757,6 +852,13 @@ fun SettingsScreen(
                     onClick = {
                         performSettingsHaptic(context)
                         runCatching {
+                            // Прямой системный диалог «Разрешить работу в фоне?» (нужно разрешение
+                            // REQUEST_IGNORE_BATTERY_OPTIMIZATIONS в манифесте)
+                            context.startActivity(
+                                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                                    .setData(Uri.parse("package:${context.packageName}"))
+                            )
+                        }.recoverCatching {
                             context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                         }.onFailure {
                             Toast.makeText(context, "Настройки -> Приложения -> Батарея -> Без ограничений", Toast.LENGTH_LONG).show()
