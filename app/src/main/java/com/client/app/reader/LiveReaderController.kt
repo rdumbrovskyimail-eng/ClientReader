@@ -72,7 +72,9 @@ interface ReaderHost {
  * управления или коротко отвечает на вопрос. Резерв — разбор входной транскрипции по ключевым словам.
  *
  * Самоконтроль: по выходной транскрипции и длительности звука проверяется, что фрагмент прочитан
- * целиком; недочитанный остаток запрашивается повторно с нужного предложения. Отдельно обрабатываются
+ * целиком; недочитанный остаток запрашивается повторно с нужного предложения. Транскрипция приходит
+ * отдельно от звука и может отставать от него на секунды (в том числе после generationComplete), поэтому
+ * вердикт «недочитано» выносится только после того, как она устоится. Отдельно обрабатываются
  * известные сбои 3.8: «немой» ответ (текст без звука), «беглое» аудио (тишина без turnComplete).
  */
 class LiveReaderController(
@@ -106,6 +108,12 @@ class LiveReaderController(
         private const val SILENT_RECOVERY_WINDOW_MS = 120_000L
         private const val ORPHAN_WAIT_MS = 4_000L
         private const val POST_STOP_DROP_MS = 6_000L
+        // Ожидание отстающей транскрипции после закрытия хода (см. settleClosedTurnLocked)
+        private const val TRANSCRIPT_SETTLE_MIN_MS = 1_200L
+        private const val TRANSCRIPT_QUIET_MS = 1_500L
+        private const val TRANSCRIPT_SETTLE_MAX_MS = 6_000L
+        // Столько речи после последнего куска транскрипции — значит, оборвалась транскрипция, а не чтение
+        private const val UNTRANSCRIBED_SPEECH_MS = 1_000L
     }
 
     private class ReadTurn(
@@ -132,6 +140,38 @@ class LiveReaderController(
         var suppressed = false
         var discarded = false
         var coverageReachedAtMs = 0L
+        // Сервер закрыл ход (generationComplete/turnComplete), а транскрипция ещё не дошла до конца текста
+        var closedAtMs = 0L
+        var closeReason = ""
+        var lastTranscriptAtMs = 0L
+        var voicedEndFrame = 0L
+    }
+
+    /** Покрытие текста фрагмента выходной транскрипцией (по основам слов). */
+    private class Coverage(
+        val words: Int,
+        val spokenWords: Int,
+        val matched: Int,
+        val covered: Int,
+        val trailing: Int,
+        val lastOffset: Int
+    ) {
+        /** Транскрипт дошёл до конца текста (допуск — ошибки распознавания последних слов). */
+        val reachedEnd: Boolean get() = words - covered <= max(2, words / 10)
+
+        /**
+         * Хвост прозвучал, но распознан иначе (имена, иностранные слова): после последнего совпадения
+         * в транскрипте ещё есть слова — примерно на объём непокрытого текста. Если модель просто
+         * остановилась, транскрипт на последнем совпадении и кончается.
+         */
+        val tailSpokenUnrecognized: Boolean
+            get() {
+                val uncovered = words - covered
+                return uncovered <= words / 4 && trailing >= max(2, (uncovered * 0.6f).toInt())
+            }
+
+        /** Транскрипт вообще похож на текст (не сплошные числа, иностранные слова или шум). */
+        val usable: Boolean get() = matched >= max(3, (min(words, spokenWords) * 0.3f).toInt())
     }
 
     private class InteractionTurn(val serverTurnId: Long, val firstSeenAtMs: Long) {
@@ -181,6 +221,8 @@ class LiveReaderController(
     private var sessionRequestInFlight = false
     private var nextSessionAttemptMs = 0L
     private var lastAudioArrivalMs = 0L
+    // Отношение «реальный звук / расчётная длительность» у фрагментов, прочитанных целиком (по транскрипции)
+    private var voicedPerExpected = 0.0
 
     // Отменённый до начала генерации фрагмент (см. claimOrphanLocked)
     private var orphanSinceMs = 0L
@@ -355,7 +397,8 @@ class LiveReaderController(
             val doc = document ?: return
             val position = pausedAt ?: playheadLocked()?.position ?: cursor
             saveSnapshotLocked(doc, position, finished = false)
-            val generationPending = inFlight != null || sendInProgress || transport.isGenerationInProgress()
+            // Ход, ждущий только транскрипцию (closedAtMs > 0), звука больше не пришлёт
+            val generationPending = inFlight?.let { it.closedAtMs == 0L } == true || sendInProgress || transport.isGenerationInProgress()
             discardInFlightLocked()
             audio.flushPlayback("reader: стоп")
             timeline.clear()
@@ -394,6 +437,7 @@ class LiveReaderController(
                     turn.voicedMs += ms
                     turn.silentRunMs = 0.0
                     turn.lastVoicedAtMs = now
+                    turn.voicedEndFrame = turn.receivedFrames
                 } else {
                     turn.silentRunMs += ms
                 }
@@ -462,10 +506,12 @@ class LiveReaderController(
                 }
             }
             if (turn == null || (turn.completed && turn !== f)) return
+            val now = host.now()
             turn.transcript.append(text)
+            turn.lastTranscriptAtMs = now
             val framesAtMark = if (turn.serverTurnId == serverTurnId) turnAudioBytes / 2 else 0L
             turn.marks += longArrayOf(framesAtMark, turn.transcript.length.toLong())
-            if (turn.coverageReachedAtMs == 0L && tailCoveredLocked(turn)) turn.coverageReachedAtMs = host.now()
+            if (turn.coverageReachedAtMs == 0L && tailCoveredLocked(turn)) turn.coverageReachedAtMs = now
         }
     }
 
@@ -484,14 +530,23 @@ class LiveReaderController(
                 }
             }
             val turn = turnsByServerId[serverTurnId] ?: return
-            if (!turn.completed) completeTurnLocked(turn, reason)
+            if (turn.completed) return
+            if (assessIncompleteLocked(turn) == null) {
+                completeTurnLocked(turn, reason)
+            } else if (turn.closedAtMs == 0L) {
+                // Транскрипция приходит отдельно от звука и часто ещё не догнала его: вердикт «недочитано»
+                // сейчас дал бы повтор уже прозвучавшего куска — ждём, пока она устоится (checkInFlightLocked)
+                turn.closedAtMs = host.now()
+                turn.closeReason = reason
+            }
         }
     }
 
     fun onServerInterrupted(serverTurnId: Long) {
         synchronized(lock) {
             val turn = turnsByServerId[serverTurnId] ?: inFlight?.takeIf { it.serverTurnId == serverTurnId } ?: return
-            if (!turn.completed) completeTurnLocked(turn, "interrupted")
+            // Генерация уже закончилась и весь звук получен — ждём транскрипцию как обычно
+            if (!turn.completed && turn.closedAtMs == 0L) completeTurnLocked(turn, "interrupted")
         }
     }
 
@@ -615,7 +670,9 @@ class LiveReaderController(
         var fresh = false
         synchronized(lock) {
             val turn = turnsByServerId[serverTurnId] ?: return
-            if (turn.completed) return
+            // Ход уже закрыт сервером и весь звук получен: текст, пришедший после конца звука, — отставание
+            // транскрипции, а не «немой» ответ (иначе прозвучавший кусок прочитался бы ещё раз)
+            if (turn.completed || turn.closedAtMs > 0L) return
             val now = host.now()
             turn.suppressed = true
             turn.completed = true
@@ -838,10 +895,16 @@ class LiveReaderController(
             lostInFlightLocked(f, "сессия сменилась")
             return
         }
+        if (f.closedAtMs > 0L) {
+            settleClosedTurnLocked(f, now)
+            return
+        }
         if (f.serverTurnId < 0L && f.transcript.isEmpty() && now - f.sentAtMs > TURN_START_TIMEOUT_MS) {
             inFlight = null
             f.completed = true
             f.discarded = true
+            // Запоздалая генерация этого запроса не должна прозвучать вместо повторного (см. claimOrphanLocked)
+            orphanSinceMs = now
             startStalls++
             host.log("Reader: модель не начала фрагмент ${f.segment + 1} за ${TURN_START_TIMEOUT_MS / 1000} с — повтор ($startStalls)")
             if (startStalls >= 2) {
@@ -859,13 +922,48 @@ class LiveReaderController(
         }
     }
 
-    private fun completeTurnLocked(turn: ReadTurn, reason: String) {
+    /**
+     * Ход закрыт сервером, но транскрипция показывает недочитку — возможно, она не догнала звук или
+     * оборвалась раньше него. Полный текст завершает ход сразу; «недочитано» — только когда транскрипция
+     * затихла, а звук не говорит об обратном, либо по истечении предельного ожидания.
+     */
+    private fun settleClosedTurnLocked(f: ReadTurn, now: Long) {
+        val sinceClose = now - f.closedAtMs
+        val quietFor = now - max(f.lastTranscriptAtMs, f.closedAtMs)
+        val quiet = sinceClose >= TRANSCRIPT_SETTLE_MIN_MS && quietFor >= TRANSCRIPT_QUIET_MS
+        when {
+            assessIncompleteLocked(f) == null -> completeTurnLocked(f, f.closeReason)
+            // После последнего куска транскрипции ещё звучала речь — оборвалась транскрипция, а не чтение
+            quiet && untranscribedSpeechMsLocked(f) >= UNTRANSCRIBED_SPEECH_MS ->
+                completeTurnLocked(f, f.closeReason, trustAudio = true)
+            // Срок вышел: транскрипция всё ещё идёт — безнадёжно отстала, верим звуку; затихла — верим ей
+            sinceClose >= TRANSCRIPT_SETTLE_MAX_MS ->
+                completeTurnLocked(f, f.closeReason, trustAudio = quietFor < TRANSCRIPT_QUIET_MS)
+            quiet && !audioSaysCompleteLocked(f) -> completeTurnLocked(f, f.closeReason)
+        }
+    }
+
+    /** Сколько речи (мс) пришло после звука, к которому относится последний кусок транскрипции хода. */
+    private fun untranscribedSpeechMsLocked(turn: ReadTurn): Long {
+        var lastMarkFrame = 0L
+        for (m in turn.marks) if (m[0] > lastMarkFrame) lastMarkFrame = m[0]
+        if (lastMarkFrame <= 0L) return 0L
+        return (turn.voicedEndFrame - lastMarkFrame).coerceAtLeast(0L) / FRAMES_PER_MS
+    }
+
+    private fun completeTurnLocked(turn: ReadTurn, reason: String, trustAudio: Boolean = false) {
         turn.completed = true
         if (inFlight === turn) inFlight = null
         startStalls = 0
         if (turn.discarded) return
         val doc = document ?: return
-        val resumeSentence = assessIncompleteLocked(turn)
+        var resumeSentence = assessIncompleteLocked(turn)
+        if (resumeSentence == null) {
+            calibrateVoiceLocked(turn)
+        } else if (trustAudio && audioSaysCompleteLocked(turn)) {
+            host.log("Reader: фрагмент ${turn.segment + 1} — транскрипция не догнала звук, по длительности звука прочитан полностью")
+            resumeSentence = null
+        }
         if (resumeSentence == null) {
             retries.remove(turn.segment)
             cursor = ReaderPosition(turn.segment + 1, 0)
@@ -884,6 +982,11 @@ class LiveReaderController(
     }
 
     private fun lostInFlightLocked(f: ReadTurn, reason: String) {
+        if (f.closedAtMs > 0L) {
+            // Генерация завершилась и весь звук получен — не успела дойти только транскрипция
+            completeTurnLocked(f, "${f.closeReason}, $reason", trustAudio = true)
+            return
+        }
         f.completed = true
         if (inFlight === f) inFlight = null
         if (f.discarded) return
@@ -1163,66 +1266,102 @@ class LiveReaderController(
 
     /** null — фрагмент прочитан полностью; иначе индекс предложения в сегменте, с которого дочитать. */
     private fun assessIncompleteLocked(turn: ReadTurn): Int? {
-        val textWords = stems(turn.text, withOffsets = true)
-        val spoken = stems(turn.transcript.toString(), withOffsets = false).map { it.first }
-        if (spoken.isEmpty()) {
+        val c = coverageLocked(turn)
+        if (c.spokenWords == 0) {
             // Транскрипция выключена или не пришла — судим по длительности реального звука
             return if (turn.voicedMs >= turn.expectedMs * 0.45) null else turn.fromSentence
         }
-        if (textWords.isEmpty()) return null
-        val match = alignLocked(textWords, spoken)
-        val ratio = match.first.toFloat() / textWords.size.toFloat()
-        val lastMatchedOffset = match.second
-        val tailOk = lastMatchedOffset >= (turn.text.length * 0.85f).toInt() || turn.coverageReachedAtMs > 0L
-        val lengthRatio = turn.transcript.length.toFloat() / turn.text.length.coerceAtLeast(1).toFloat()
-        if (tailOk && (ratio >= 0.55f || lengthRatio >= 0.7f)) return null
-        if (ratio >= 0.85f) return null
-        if (turn.voicedMs >= turn.expectedMs * 0.8 && lengthRatio >= 0.75f) return null
-        val rel = lastMatchedOffset.coerceAtLeast(0)
+        if (c.words == 0) return null
+        if (!c.usable) {
+            // Транскрипт почти не совпадает с текстом (первые слова, иностранный текст, сплошь числа) —
+            // по нему судить нельзя, судим по длительности звука
+            return if (turn.voicedMs >= turn.expectedMs * 0.45) null else turn.fromSentence
+        }
+        if (c.reachedEnd || c.tailSpokenUnrecognized) return null
+        val rel = c.lastOffset
         var k = sentenceIndexAt(turn, rel)
         val sentenceEnd = if (k + 1 < turn.sentenceOffsets.size) turn.sentenceOffsets[k + 1] else turn.text.length
         val sentenceStart = turn.sentenceOffsets[k]
-        if (lastMatchedOffset >= 0 && rel >= sentenceStart + (sentenceEnd - sentenceStart) * 0.9f) k += 1
+        if (rel >= sentenceStart + (sentenceEnd - sentenceStart) * 0.9f) k += 1
         if (k >= turn.sentenceOffsets.size) return null
         return turn.fromSentence + k
     }
 
     /** Индекс (относительно turn) предложения, до которого фрагмент успел прозвучать. */
     private fun assessCoverageEndLocked(turn: ReadTurn): Int {
-        val textWords = stems(turn.text, withOffsets = true)
-        val spoken = stems(turn.transcript.toString(), withOffsets = false).map { it.first }
-        if (textWords.isEmpty() || spoken.isEmpty()) return 0
-        val lastOffset = alignLocked(textWords, spoken).second
-        if (lastOffset < 0) return 0
-        return sentenceIndexAt(turn, lastOffset)
+        val c = coverageLocked(turn)
+        if (c.lastOffset < 0) return 0
+        return sentenceIndexAt(turn, c.lastOffset)
     }
 
-    /** Последовательное сопоставление основ слов текста и транскрипта (окно ±8 слов). */
-    private fun alignLocked(textWords: List<Pair<String, Int>>, spoken: List<String>): Pair<Int, Int> {
-        var j = 0
-        var matched = 0
-        var lastOffset = -1
-        for ((stem, offset) in textWords) {
-            val limit = min(spoken.size, j + 8)
-            var k = j
-            while (k < limit && spoken[k] != stem) k++
-            if (k < limit) {
-                matched++
-                j = k + 1
-                lastOffset = offset
+    private fun coverageLocked(turn: ReadTurn): Coverage {
+        val textWords = stems(turn.text, withOffsets = true)
+        val spoken = stems(turn.transcript.toString(), withOffsets = false).map { it.first }
+        val a = alignLocked(textWords, spoken)
+        val covered = a[1]
+        val lastOffset = if (covered > 0) textWords[covered - 1].second else -1
+        return Coverage(textWords.size, spoken.size, a[0], covered, spoken.size - a[2], lastOffset)
+    }
+
+    /**
+     * Сопоставление основ слов текста и транскрипта — наибольшая общая подпоследовательность. Устойчиво
+     * к длинным вставкам (числа, даты, сокращения, прочитанные словами), пропускам и ошибкам распознавания.
+     * @return [совпало слов, слов текста до последнего совпавшего включительно, то же для транскрипта];
+     * границы — самые ранние, чтобы случайное совпадение в конце не «дочитывало» текст.
+     */
+    private fun alignLocked(textWords: List<Pair<String, Int>>, spoken: List<String>): IntArray {
+        val n = textWords.size
+        val m = spoken.size
+        if (n == 0 || m == 0) return IntArray(3)
+        var prev = IntArray(m + 1)
+        var cur = IntArray(m + 1)
+        val lastColumn = IntArray(n + 1)
+        for (i in 1..n) {
+            val stem = textWords[i - 1].first
+            cur[0] = 0
+            for (j in 1..m) {
+                cur[j] = if (spoken[j - 1] == stem) prev[j - 1] + 1 else max(prev[j], cur[j - 1])
             }
+            lastColumn[i] = cur[m]
+            val swap = prev
+            prev = cur
+            cur = swap
         }
-        return matched to lastOffset
+        val matched = lastColumn[n]
+        var covered = n
+        while (covered > 0 && lastColumn[covered - 1] == matched) covered--
+        // prev — последняя строка таблицы: совпадения всего текста с началом транскрипта
+        var spokenCovered = m
+        while (spokenCovered > 0 && prev[spokenCovered - 1] == matched) spokenCovered--
+        return intArrayOf(matched, covered, spokenCovered)
     }
 
     private fun tailCoveredLocked(turn: ReadTurn): Boolean {
         val textWords = stems(turn.text, withOffsets = true)
         if (textWords.isEmpty()) return false
-        val tail = textWords.takeLast(2).map { it.first }
         val spoken = stems(turn.transcript.toString(), withOffsets = false).map { it.first }
-        if (spoken.isEmpty()) return false
-        val window = spoken.takeLast(max(6, spoken.size / 2))
-        return tail.all { it in window }
+        // Быстрый отсев: до конца текста транскрипту ещё далеко
+        if (spoken.size < textWords.size * 0.6f) return false
+        val a = alignLocked(textWords, spoken)
+        val c = Coverage(textWords.size, spoken.size, a[0], a[1], spoken.size - a[2], -1)
+        // Транскрипт дошёл до конца по порядку (а не совпал с частым словом где-то в середине)
+        // или конец прозвучал, но распознан иначе
+        return c.usable && (c.words - c.covered <= 2 || c.tailSpokenUnrecognized)
+    }
+
+    /** По длительности реального звука фрагмент прозвучал целиком (калибровка — по проверенным фрагментам). */
+    private fun audioSaysCompleteLocked(turn: ReadTurn): Boolean {
+        if (turn.expectedMs <= 0L) return false
+        val k = if (voicedPerExpected > 0.0) voicedPerExpected * 0.9 else 0.85
+        return turn.voicedMs >= turn.expectedMs * k
+    }
+
+    private fun calibrateVoiceLocked(turn: ReadTurn) {
+        if (turn.expectedMs < 4_000L || turn.voicedMs < 2_000.0) return
+        val c = coverageLocked(turn)
+        if (c.spokenWords == 0 || !c.usable || !c.reachedEnd) return
+        val r = (turn.voicedMs / turn.expectedMs).coerceIn(0.3, 2.0)
+        voicedPerExpected = if (voicedPerExpected <= 0.0) r else voicedPerExpected * 0.7 + r * 0.3
     }
 
     private fun stems(text: String, withOffsets: Boolean): List<Pair<String, Int>> {
